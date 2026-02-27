@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY breaker/ ./breaker/
 COPY cache.py ./
 COPY utils.py ./
-COPY ridges/ ./ridges/
+COPY agent/ridges/ ./ridges/
 
 ENTRYPOINT ["python", "-m", "breaker.service", \
             "--run-scripts-dir", "/app/ridges/run_scripts"]
