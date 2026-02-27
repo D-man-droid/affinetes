@@ -288,8 +288,12 @@ def _generate_flights(
     # Number of flights: 8-15 based on distance and city size
     num_flights = rng.randint(8, 15)
 
-    # Generate departure times spread across the day (05:00-23:00)
-    dep_minutes = sorted(rng.sample(range(300, 1380), num_flights))  # 05:00-23:00
+    # Generate departure times: normal daytime + red-eye flights
+    num_redeye = rng.randint(1, 2)
+    num_normal = num_flights - num_redeye
+    normal_deps = sorted(rng.sample(range(300, 1380), min(num_normal, 1080)))
+    redeye_deps = [rng.randint(1380, 1500) for _ in range(num_redeye)]  # 23:00-01:00
+    dep_minutes = sorted(normal_deps + redeye_deps)
 
     flights = []
     used_flight_numbers = set()
@@ -325,14 +329,27 @@ def _generate_flights(
         dep_h, dep_m = divmod(dep_min, 60)
         arr_h, arr_m = divmod(arr_min, 60)
 
-        # Skip if arrival goes past midnight
+        # Handle next-day arrival for red-eye flights
+        next_day = ""
         if arr_h >= 24:
-            continue
+            arr_h -= 24
+            next_day = "(次日)"
 
-        # Price based on distance + variation
+        # Normalize departure hour for display (handle >24h)
+        display_dep_h = dep_h % 24 if dep_h >= 24 else dep_h
+
+        # Price based on distance + skewed variation
         base_price = distance * 0.5 + 100
-        price_variation = rng.uniform(0.7, 1.5)
+        is_redeye = dep_min >= 1380 or dep_min < 300
+        # Price skew: 30% economy + 70% premium
+        if rng.random() < 0.3:
+            price_variation = rng.uniform(0.55, 0.85)  # Economy option
+        else:
+            price_variation = rng.uniform(1.1, 1.7)    # Premium option
         price = round(base_price * price_variation)
+        # Red-eye discount
+        if is_redeye:
+            price = int(price * rng.uniform(0.6, 0.8))
         price = max(200, min(8000, price))
 
         # Duration string
@@ -342,8 +359,8 @@ def _generate_flights(
 
         record = (
             f"航班 {flight_id}，价格{price}元，"
-            f"{dep_h:02d}:{dep_m:02d}从{dep_airport}出发，"
-            f"{arr_h:02d}:{arr_m:02d}到达{arr_airport}，"
+            f"{display_dep_h:02d}:{dep_m:02d}从{dep_airport}出发，"
+            f"{arr_h:02d}:{arr_m:02d}{next_day}到达{arr_airport}，"
             f"飞行时长{duration_str}"
         )
         flights.append(record)
@@ -426,9 +443,16 @@ def _generate_trains(
             else:
                 continue
 
-        # Price
+        # Price — skewed distribution for high-speed trains (G/D/C)
         base_price = distance * price_per_km
-        price_variation = rng.uniform(0.85, 1.15)
+        if prefix in ("G", "D", "C"):
+            # Skewed: 30% economy + 70% premium
+            if rng.random() < 0.3:
+                price_variation = rng.uniform(0.55, 0.85)
+            else:
+                price_variation = rng.uniform(1.1, 1.7)
+        else:
+            price_variation = rng.uniform(0.85, 1.15)  # Z/T/K keep uniform
         price = round(base_price * price_variation)
         price = max(30, min(3000, price))
 

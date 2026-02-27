@@ -97,9 +97,10 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 【维度2: 信息丰富度 informativeness】(0-10分)
 检查提供的信息是否全面有用。
-- 10分: 包含详细的交通、住宿、餐饮、景点信息及实用Tips
-- 5分: 信息基本完整但缺乏细节
-- 0分: 信息稀少，缺乏实用价值
+- 9-10分: 每天都有具名景点(≥2个)+具体餐厅推荐+住宿建议，交通有具体班次号和价格
+- 6-8分: 信息基本完整，但部分天缺乏具体名称或价格
+- 3-5分: 仅有笼统描述，具体信息（名称、价格、时间）不足一半天数
+- 0-2分: 信息稀少，几乎无实用价值
 
 【维度3: 逻辑连贯性 logic】(0-10分)
 检查规划的逻辑是否清晰连贯。
@@ -109,9 +110,10 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 【维度4: 用户体验 user_experience】(0-10分)
 检查规划是否考虑用户需求和体验。
-- 10分: 完美符合用户偏好，考虑舒适度和个性化需求
-- 5分: 部分考虑用户需求
-- 0分: 完全忽视用户需求，通用模板
+- 9-10分: 明确回应所有用户约束和偏好，预算分配合理，矛盾约束有明确权衡说明
+- 6-8分: 回应了大部分需求，但部分约束或偏好未体现
+- 3-5分: 仅部分考虑，多数约束被忽略，预算分配不合理
+- 0-2分: 完全忽视用户需求，通用模板
 
 === 输出格式 ===
 
@@ -130,7 +132,17 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 
 class LLMValidator:
-    """LLM-based semantic quality evaluator."""
+    """LLM-based semantic quality evaluator with fallback models and circuit breaker.
+
+    All models use Chutes API (same base_url and api_key).
+    Fallback order: primary → FALLBACK_MODELS in sequence.
+    """
+
+    # Chutes fallback models — tried in order when primary fails
+    FALLBACK_MODELS = [
+        "deepseek-ai/DeepSeek-V3-0324",
+        "Qwen/Qwen3-235B-A22B",
+    ]
 
     def __init__(
         self,
@@ -139,12 +151,10 @@ class LLMValidator:
         api_key: Optional[str] = None,
     ):
         self.model = model
-        self.base_url = base_url
         self.api_key = api_key or os.getenv("CHUTES_API_KEY")
-        self.client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=self.api_key,
-        )
+        self.client = AsyncOpenAI(base_url=base_url, api_key=self.api_key)
+        self._consecutive_failures = 0
+        self._circuit_open = False
 
     async def validate(
         self,
@@ -152,7 +162,7 @@ class LLMValidator:
         problem: TravelProblem,
         tool_trace: List[Dict],
     ) -> LLMValidationResult:
-        """Execute LLM validation."""
+        """Execute LLM validation with fallback and circuit breaker."""
         if not tool_trace:
             return LLMValidationResult(
                 tool_info_used=False,
@@ -160,31 +170,78 @@ class LLMValidator:
                 success=True,
             )
 
+        if self._circuit_open:
+            return LLMValidationResult(
+                success=False,
+                error=f"Circuit breaker open after {self._consecutive_failures} consecutive failures",
+            )
+
         prompt = self._build_prompt(model_output, problem, tool_trace)
 
-        max_retries = 3
+        # Try primary, then fallbacks — all on same Chutes client
+        models = [self.model] + self.FALLBACK_MODELS
+        for model_name in models:
+            retries = 2 if model_name == self.model else 1
+            result = await self._try_validate_with_retries(
+                self.client, model_name, prompt, retries=retries
+            )
+            if result.success:
+                self._consecutive_failures = 0
+                return result
+            print(f"[LLM_VALIDATOR] {model_name} failed: {result.error}")
+
+        # All failed
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 3:
+            self._circuit_open = True
+            print(f"[LLM_VALIDATOR] Circuit breaker OPENED after {self._consecutive_failures} failures")
+
+        return LLMValidationResult(
+            success=False,
+            error=f"All {len(models)} models failed (consecutive={self._consecutive_failures})",
+        )
+
+    async def _try_validate_with_retries(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        prompt: str,
+        retries: int = 2,
+    ) -> LLMValidationResult:
+        """Try validation with a specific client/model, with retries and timeout."""
         last_error = None
-        for attempt in range(max_retries):
+        for attempt in range(retries + 1):
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    max_tokens=2000,
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=2000,
+                    ),
+                    timeout=30,
                 )
-
                 content = response.choices[0].message.content
-                return self._parse_response(content)
-
+                result = self._parse_response(content)
+                if result.success:
+                    return result
+                # Parse succeeded but content was garbage — don't retry same model
+                last_error = Exception(f"Parse failed: {result.error}")
+                break
+            except asyncio.TimeoutError:
+                last_error = Exception(f"Timeout after 30s")
+                if attempt < retries:
+                    await asyncio.sleep(1)
+                    continue
             except Exception as e:
                 last_error = e
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+                if attempt < retries:
+                    await asyncio.sleep(2 ** attempt)
                     continue
 
         return LLMValidationResult(
             success=False,
-            error=f"Failed after {max_retries} attempts: {last_error}",
+            error=f"{model} failed after {retries + 1} attempts: {last_error}",
         )
 
     def _build_prompt(
@@ -388,9 +445,5 @@ def get_llm_validator(
 ) -> LLMValidator:
     global _default_validator
     if _default_validator is None:
-        _default_validator = LLMValidator(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-        )
+        _default_validator = LLMValidator(model=model, base_url=base_url, api_key=api_key)
     return _default_validator

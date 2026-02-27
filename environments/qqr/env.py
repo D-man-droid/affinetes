@@ -15,6 +15,8 @@ Scoring structure:
 - LLM score (30 pts): smooth coupling with code score via LLM_CODE_RATIO_FACTOR
 """
 
+import asyncio
+import gc
 import json
 import os
 import random
@@ -49,6 +51,9 @@ from llm_validator import LLMValidator
 from affinetes.core.openenv import OpenEnvResponse
 
 # ==================== MCP Server Configuration (QQR Format) ====================
+# Fix epoch salt at import time — stable within a single process lifetime
+_EPOCH_SALT = os.getenv("TRANSPORT_SALT", str(int(time.time()) // (7 * 86400)))
+
 def mcp_server_config_fn() -> list:
     """
     MCP server configuration function.
@@ -80,7 +85,7 @@ def mcp_server_config_fn() -> list:
     # Transport server configuration
     # Uses deterministic algorithmic generation (no LLM dependency)
     # TRANSPORT_SALT changes weekly for anti-memorization
-    epoch_salt = os.getenv("TRANSPORT_SALT", str(int(time.time()) // (7 * 86400)))
+    epoch_salt = _EPOCH_SALT
     transport_server_params = MCPServerStdioParams(
         command="python",
         args=["-m", "mock_transport.server"],
@@ -263,13 +268,14 @@ class Actor:
     ):
         self._episodes: Dict[str, EpisodeState] = {}
         self._generator = get_generator()
+        self._llm_validator_model = llm_validator_model
 
         # ==================== Reuse QQR's MCPState ====================
         # MCPState is singleton, initialized with our config function
         self._mcp_state = MCPState(mcp_server_config_fn)
         self._mcp_initialized = False
 
-        # LLM Validator
+        # LLM Validator with fallback models and circuit breaker
         self._llm_validator = None
         if enable_llm_validator:
             api_key = os.getenv("CHUTES_API_KEY")
@@ -434,7 +440,7 @@ class Actor:
                 tool_results.append({
                     "tool": name,
                     "call_id": call_id,
-                    "result": result_content[:2000] if len(result_content) > 2000 else result_content
+                    "result": self._truncate_tool_result(result_content, max_chars=2000),
                 })
 
             # Combine all tool results into one user message (Chutes API workaround)
@@ -478,24 +484,11 @@ class Actor:
             # No tool calls or max steps reached, perform scoring
             ep.done = True
 
-            # If action is empty or too short (e.g. "让我查一下" from max steps),
-            # fall back to last substantive assistant message from conversation.
-            # For messages with tool calls, extract content before "正在调用以下工具".
+            # scoring_input is the model's final answer.
+            # evaluate() ensures this is a complete answer via the
+            # dedicated final-answer phase, so no fallback needed.
             scoring_input = action or ""
-            if not scoring_input.strip() or (
-                len(scoring_input.strip()) < 100
-                and not re.search(r'(第.天|Day\s*\d|航班|火车|景点)', scoring_input)
-            ):
-                for msg in reversed(ep.conversation):
-                    if msg.get("role") == "assistant" and msg.get("content", "").strip():
-                        content = msg["content"]
-                        # Extract content before tool call descriptions
-                        if "正在调用以下工具" in content:
-                            content = content.split("正在调用以下工具")[0].strip()
-                        if len(content) > len(scoring_input):
-                            scoring_input = content
-                            if len(content) >= 100:
-                                break  # Found substantive content
+            print(f"[DEBUG] scoring_input: len={len(scoring_input)}")
 
             try:
                 score_result = await self._scorer.score(
@@ -532,100 +525,357 @@ class Actor:
         temperature: float = 0.7,
         api_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Complete evaluation flow using OpenAI Function Calling."""
+        """Complete evaluation flow using OpenAI Function Calling.
+
+        Two-phase design:
+        Phase 1 — Tool calling: model calls tools to gather information.
+        Phase 2 — Final answer: model produces a complete travel plan.
+                  If the model's natural answer is insufficient, an explicit
+                  final-answer prompt is sent (with tools=None to prevent
+                  further tool calls).
+        """
         start_time = datetime.now()
         seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         task_id = task_id if task_id is not None else (seed & 0x7FFFFFFF)
         api_key = api_key or os.getenv("CHUTES_API_KEY")
+
+        # Lazy-init LLM validator when api_key arrives via evaluate() param
+        if api_key and not self._llm_validator:
+            self._llm_validator = LLMValidator(
+                model=self._llm_validator_model,
+                base_url="https://llm.chutes.ai/v1",
+                api_key=api_key,
+            )
+            self._scorer = TravelScorer(llm_validator=self._llm_validator)
 
         reset_resp = await self.reset(task_id=task_id, seed=seed)
         episode_id = reset_resp.episode_id
         ep = self._episodes[episode_id]
 
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        final_content = None
+        llm_failed = False
 
-        async with httpx.AsyncClient(timeout=float(timeout)) as client:
-            for _ in range(MAX_TOOL_STEPS + 2):
-                # Call LLM
-                response = await self._call_llm(
-                    client=client,
-                    messages=ep.conversation,
-                    model=model,
-                    base_url=base_url,
-                    api_key=api_key,
-                    temperature=temperature,
-                    timeout=timeout,
-                    tools=TOOLS_SCHEMA,
-                )
+        try:
+            async with httpx.AsyncClient(timeout=float(timeout)) as client:
+                # ===== Phase 1: Tool-calling loop =====
+                for _ in range(MAX_TOOL_STEPS + 2):
+                    response = await self._call_llm(
+                        client=client,
+                        messages=ep.conversation,
+                        model=model,
+                        base_url=base_url,
+                        api_key=api_key,
+                        temperature=temperature,
+                        timeout=timeout,
+                        tools=TOOLS_SCHEMA,
+                    )
 
-                if response is None:
-                    print(f"[DEBUG] LLM returned None, triggering scoring with existing conversation")
-                    # Trigger scoring with whatever conversation exists
-                    step_resp = await self.step(action="", episode_id=episode_id, tool_calls=None)
-                    break
+                    if response is None:
+                        print(f"[DEBUG] LLM returned None in tool-calling phase")
+                        llm_failed = True
+                        break
 
-                content = response.get("content") or ""
-                tool_calls = response.get("tool_calls")
-                usage = response.get("usage", {})
-                print(f"[DEBUG] LLM response: content_len={len(content)}, tool_calls={len(tool_calls) if tool_calls else 0}")
-                if tool_calls:
-                    print(f"[DEBUG] tool_calls sample: {tool_calls[0] if tool_calls else 'none'}")
+                    content = response.get("content") or ""
+                    tool_calls = response.get("tool_calls")
+                    usage = response.get("usage", {})
+                    print(f"[DEBUG] LLM response: content_len={len(content)}, tool_calls={len(tool_calls) if tool_calls else 0}")
 
-                if usage:
-                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                    if usage:
+                        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
 
-                # Execute one step
-                step_resp = await self.step(
-                    action=content,
-                    episode_id=episode_id,
-                    tool_calls=tool_calls,
-                )
+                    if tool_calls:
+                        print(f"[DEBUG] tool_calls sample: {tool_calls[0]}")
+                        # Check if we'd exceed MAX_TOOL_STEPS — if so, stop
+                        # tool-calling and move to Phase 2 for a proper final answer
+                        if ep.current_step >= MAX_TOOL_STEPS:
+                            print(f"[DEBUG] MAX_TOOL_STEPS reached ({ep.current_step}), ending tool phase")
+                            final_content = content
+                            break
+                        # Execute tools via step() — returns done=False
+                        step_resp = await self.step(
+                            action=content,
+                            episode_id=episode_id,
+                            tool_calls=tool_calls,
+                        )
+                    else:
+                        # Model stopped calling tools — this is its natural answer
+                        final_content = content
+                        print(f"[DEBUG] Model gave natural answer: len={len(content)}")
+                        break
 
-                if step_resp.done:
-                    break
+                # ===== Phase 2: Ensure a complete final answer =====
+                ep_check = self._episodes.get(episode_id)
+                if ep_check and not ep_check.done:
+                    if llm_failed and final_content is None:
+                        # LLM failed — retry up to 3 times with increasing delay
+                        for retry_i in range(3):
+                            wait_secs = 2 ** retry_i  # 1, 2, 4 seconds
+                            print(f"[DEBUG] Retrying LLM call ({retry_i+1}/3) after {wait_secs}s wait")
+                            await asyncio.sleep(wait_secs)
+                            response = await self._call_llm(
+                                client=client,
+                                messages=ep.conversation,
+                                model=model,
+                                base_url=base_url,
+                                api_key=api_key,
+                                temperature=temperature,
+                                timeout=timeout,
+                                tools=TOOLS_SCHEMA,
+                            )
+                            if response:
+                                final_content = response.get("content") or ""
+                                tool_calls = response.get("tool_calls")
+                                usage = response.get("usage", {})
+                                if usage:
+                                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                                # If model wants to call tools, let it do one round
+                                if tool_calls and ep.current_step < MAX_TOOL_STEPS:
+                                    await self.step(action=final_content, episode_id=episode_id, tool_calls=tool_calls)
+                                    final_content = None  # Need another response
+                                    continue
+                                break
+
+                    if not self._is_substantive_answer(final_content, ep.problem):
+                        # Answer is not complete — explicitly request final answer
+                        # with tools=None so the model MUST produce text
+                        print(f"[DEBUG] Answer not substantive (len={len(final_content or '')}), requesting final answer")
+                        prompt = self._build_final_answer_prompt(ep.problem)
+                        ep.conversation.append({"role": "user", "content": prompt})
+
+                        response = await self._call_llm(
+                            client=client,
+                            messages=ep.conversation,
+                            model=model,
+                            base_url=base_url,
+                            api_key=api_key,
+                            temperature=temperature,
+                            timeout=timeout,
+                            tools=None,  # No tools — force text answer
+                        )
+                        if response and response.get("content"):
+                            final_content = response.get("content")
+                            usage = response.get("usage", {})
+                            if usage:
+                                total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                                total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                            print(f"[DEBUG] Got final answer via explicit request: len={len(final_content)}")
+                        else:
+                            print(f"[DEBUG] Final answer request also failed")
+
+                    # Phase 3: Score with the final answer
+                    step_resp = await self.step(
+                        action=final_content or "",
+                        episode_id=episode_id,
+                        tool_calls=None,
+                    )
+
+            final_ep = self._episodes.get(episode_id)
+            if not final_ep:
+                return {
+                    "task_name": "qqr",
+                    "score": 0.0,
+                    "success": False,
+                    "time_taken": (datetime.now() - start_time).total_seconds(),
+                    "extra": {"error": "episode not found", "seed": seed, "task_id": task_id},
+                }
+
+            score = final_ep.final_score
+
+            # Build result with truncated conversation to reduce memory
+            # Keep only first 2 messages (system + user prompt) and last 2 messages
+            conv = final_ep.conversation
+            if len(conv) > 6:
+                truncated_conv = conv[:2] + [{"role": "system", "content": f"... {len(conv) - 4} messages omitted ..."}] + conv[-2:]
             else:
-                # Loop exhausted without scoring — model kept calling tools
-                # Force scoring with whatever conversation exists
-                if not step_resp or not step_resp.done:
-                    step_resp = await self.step(action="", episode_id=episode_id, tool_calls=None)
+                truncated_conv = conv
 
-        final_ep = self._episodes.get(episode_id)
-        if not final_ep:
-            return {
+            result = {
                 "task_name": "qqr",
-                "score": 0.0,
-                "success": False,
+                "score": score / 100.0,
+                "success": score >= 60,
                 "time_taken": (datetime.now() - start_time).total_seconds(),
-                "extra": {"error": "episode not found", "seed": seed, "task_id": task_id},
+                "extra": {
+                    "conversation": truncated_conv,
+                    "conversation_total_messages": len(conv),
+                    "tool_trace": final_ep.tool_trace,
+                    "seed": seed,
+                    "task_id": task_id,
+                    "usage": total_usage,
+                    "score_raw": score,
+                    "score_breakdown": final_ep.score_breakdown,
+                    "problem": final_ep.problem.to_dict(),
+                    "step_rewards": final_ep.step_rewards,
+                    "avg_step_reward": (
+                        sum(final_ep.step_rewards) / len(final_ep.step_rewards)
+                        if final_ep.step_rewards else 0.0
+                    ),
+                },
             }
+            return result
 
-        score = final_ep.final_score
+        finally:
+            # Clean up episode and MCP connections to prevent memory leaks
+            self._episodes.pop(episode_id, None)
+            if self._mcp_state:
+                try:
+                    await self._mcp_state.cleanup()
+                except BaseException as e:
+                    print(f"[DEBUG] MCP cleanup error (ignored): {e}")
+                self._mcp_initialized = False
+            gc.collect()
 
-        # Clean up episode after evaluation
-        del self._episodes[episode_id]
-
-        return {
-            "task_name": "qqr",
-            "score": score / 100.0,
-            "success": score >= 60,
-            "time_taken": (datetime.now() - start_time).total_seconds(),
-            "extra": {
-                "conversation": final_ep.conversation,
-                "tool_trace": final_ep.tool_trace,
-                "seed": seed,
-                "task_id": task_id,
-                "usage": total_usage,
-                "score_raw": score,
-                "score_breakdown": final_ep.score_breakdown,
-                "problem": final_ep.problem.to_dict(),
-                "step_rewards": final_ep.step_rewards,
-                "avg_step_reward": (
-                    sum(final_ep.step_rewards) / len(final_ep.step_rewards)
-                    if final_ep.step_rewards else 0.0
-                ),
-            },
+    def _is_substantive_answer(self, content: Optional[str], problem: TravelProblem) -> bool:
+        """Check if content is a substantive final answer worth scoring."""
+        if not content or len(content.strip()) < 200:
+            return False
+        type_patterns = {
+            "intercity": r'(航班|火车|高铁|飞机|车次)',
+            "multiday": r'(?:第\s*(?:\d+|[一二三四五六七八九十]+)\s*天|Day\s*\d+)',
+            "hybrid": r'(航班|火车|高铁|第\s*[一二三四五六七八九十\d]+\s*天|Day\s*\d+)',
+            "single_poi": r'(景点|游览|路线|门票|开放)',
+            "food_tour": r'(美食|餐厅|小吃|特色|推荐)',
+            "business": r'(航班|火车|高铁|酒店|商务)',
+            "family_study": r'(亲子|儿童|学习|博物馆|科技馆|体验)',
         }
+        pattern = type_patterns.get(problem.problem_type)
+        if pattern:
+            return bool(re.search(pattern, content))
+        return True
+
+    @staticmethod
+    def _truncate_tool_result(content: str, max_chars: int = 2000) -> str:
+        """Truncate tool result at JSON-structure boundaries.
+
+        If the content is a JSON array, keeps complete items that fit.
+        If it's a JSON object, keeps complete top-level keys.
+        Falls back to raw truncation with a marker if not JSON.
+        """
+        if len(content) <= max_chars:
+            return content
+
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            # Not valid JSON — truncate at last newline before limit
+            cut = content[:max_chars].rfind('\n')
+            if cut < max_chars // 2:
+                cut = max_chars
+            return content[:cut] + f"\n... (truncated, {len(content)} chars total)"
+
+        if isinstance(data, list):
+            # Keep complete items that fit within budget
+            kept = []
+            current_len = 2  # for "[]"
+            for item in data:
+                item_json = json.dumps(item, ensure_ascii=False)
+                if current_len + len(item_json) + 2 > max_chars:  # +2 for ", "
+                    break
+                kept.append(item)
+                current_len += len(item_json) + 2
+            if len(kept) < len(data):
+                result = json.dumps(kept, ensure_ascii=False, indent=None)
+                return result + f"\n... ({len(kept)}/{len(data)} items shown)"
+            return json.dumps(kept, ensure_ascii=False, indent=None)
+
+        elif isinstance(data, dict):
+            # Try to keep as much of the dict as possible
+            result_json = json.dumps(data, ensure_ascii=False, indent=None)
+            if len(result_json) <= max_chars:
+                return result_json
+            # Remove keys from the end until it fits
+            keys = list(data.keys())
+            kept = {}
+            current_len = 2  # for "{}"
+            for k in keys:
+                entry = json.dumps({k: data[k]}, ensure_ascii=False)
+                if current_len + len(entry) > max_chars:
+                    break
+                kept[k] = data[k]
+                current_len += len(entry)
+            result = json.dumps(kept, ensure_ascii=False, indent=None)
+            return result + f"\n... ({len(kept)}/{len(keys)} fields shown)"
+
+        # Scalar or other type
+        return content[:max_chars]
+
+    def _build_final_answer_prompt(self, problem: TravelProblem) -> str:
+        """Build a problem-type-specific prompt requesting the final answer."""
+        type_requirements = {
+            "intercity": (
+                "方案必须包含：\n"
+                "1. 具体的航班或火车车次推荐（包含编号、出发/到达时间、价格）\n"
+                "2. 目的地景点、酒店、餐厅推荐（使用工具查询到的具体名称和地址）\n"
+                "3. 天气情况及出行建议\n"
+                "4. 景点之间的交通路线和时间\n"
+                "5. 预算明细"
+            ),
+            "multiday": (
+                "方案必须按天安排（第一天、第二天...），每天包含：\n"
+                "1. 景点安排（使用工具查询到的具体名称和地址）\n"
+                "2. 景点之间的交通路线和所需时间\n"
+                "3. 餐饮推荐\n"
+                "4. 住宿推荐\n"
+                "5. 天气情况及注意事项\n"
+                "6. 每日预算"
+            ),
+            "hybrid": (
+                "方案必须包含：\n"
+                "1. 城际交通推荐（航班/火车车次、时间、价格）\n"
+                "2. 按天安排的详细行程（第一天、第二天...）\n"
+                "3. 每天的景点、餐饮、交通安排\n"
+                "4. 天气情况\n"
+                "5. 总体预算"
+            ),
+            "single_poi": (
+                "方案必须包含：\n"
+                "1. 景点详细信息（名称、地址、门票、开放时间）\n"
+                "2. 周边推荐（餐厅、住宿等，使用工具查询到的具体名称）\n"
+                "3. 游览路线建议及交通方式\n"
+                "4. 天气情况及出行建议"
+            ),
+            "food_tour": (
+                "方案必须包含：\n"
+                "1. 具体的美食/餐厅推荐（使用工具查询到的名称和地址）\n"
+                "2. 推荐的美食路线和顺序\n"
+                "3. 各餐厅之间的交通方式和时间\n"
+                "4. 特色菜品推荐\n"
+                "5. 天气情况\n"
+                "6. 预算建议"
+            ),
+            "business": (
+                "方案必须包含：\n"
+                "1. 航班或火车车次推荐（编号、时间、价格）\n"
+                "2. 商务酒店推荐（名称、地址、价格）\n"
+                "3. 会议/办公相关设施\n"
+                "4. 商务餐饮推荐\n"
+                "5. 天气情况\n"
+                "6. 详细的时间安排"
+            ),
+            "family_study": (
+                "方案必须包含：\n"
+                "1. 亲子/研学景点推荐（博物馆、科技馆等，具体名称和地址）\n"
+                "2. 适合儿童的体验活动\n"
+                "3. 景点之间的交通路线\n"
+                "4. 亲子餐饮推荐\n"
+                "5. 天气情况及安全提示\n"
+                "6. 预算明细"
+            ),
+        }
+
+        requirements = type_requirements.get(
+            problem.problem_type,
+            "方案必须包含具体的地点名称、交通安排、时间规划和预算明细。"
+        )
+
+        return (
+            "请根据以上所有工具查询到的信息，给出完整、详细的旅行规划方案。\n\n"
+            f"{requirements}\n\n"
+            "**重要**：方案中的所有地点名称、交通信息、价格等必须来自工具查询结果，不要编造。\n"
+            "请直接输出完整方案，不要再调用任何工具。"
+        )
 
     async def _call_llm(
         self,
@@ -694,7 +944,14 @@ class Actor:
         )
 
     async def cleanup(self):
-        """Clean up resources."""
-        # MCPState is singleton, usually doesn't need cleanup
-        # But cleanup logic can be added here if needed
-        pass
+        """Clean up resources — close MCP servers and release memory."""
+        # Clear any lingering episodes
+        self._episodes.clear()
+        # Shut down MCP servers
+        if self._mcp_state:
+            try:
+                await self._mcp_state.cleanup()
+            except Exception as e:
+                print(f"[WARN] MCPState cleanup error: {e}")
+            self._mcp_initialized = False
+        gc.collect()

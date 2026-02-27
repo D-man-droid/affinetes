@@ -197,6 +197,24 @@ class MCPState(metaclass=SingletonMeta):
                         raise e
         return self._mcp_servers
 
+    async def cleanup(self):
+        """Shut down all MCP servers and release resources."""
+        if self._mcp_servers:
+            for server in self._mcp_servers:
+                try:
+                    await asyncio.wait_for(server.cleanup(), timeout=5)
+                    logger.info(f"MCP Server {server.name} cleaned up.")
+                except BaseException as e:
+                    logger.warning(f"Error cleaning up MCP Server {server.name}: {e}")
+            self._mcp_servers = None
+            self.tools = []
+            self.tool_to_server = {}
+
+    @classmethod
+    def reset_singleton(cls):
+        """Remove singleton instance so next __call__ creates a fresh one."""
+        SingletonMeta._instances.pop(cls, None)
+
     async def call_tool(self, tool_call: dict) -> dict:
         """Call a tool by name with arguments."""
         await self.get_mcp_servers()

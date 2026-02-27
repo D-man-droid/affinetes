@@ -129,25 +129,30 @@ PROBLEM_TYPES = [
 ]
 
 # Tool coverage threshold by problem type
+# Non-transport types use 0.5 (half of required tools must be called)
+# because direction/around_search require coordinates that models often
+# cannot extract from text-format tool results (Chutes API workaround)
 REQUIRED_TOOLS_THRESHOLD = {
     "intercity": 0.6,
-    "multiday": 0.75,
-    "hybrid": 0.67,
-    "single_poi": 0.75,
-    "food_tour": 0.75,
+    "multiday": 0.5,
+    "hybrid": 0.5,
+    "single_poi": 0.5,
+    "food_tour": 0.5,
     "business": 0.6,
-    "family_study": 0.75,
+    "family_study": 0.5,
 }
 
 # Core tools that must all be called
+# Only poi_search is truly irreplaceable — direction/around_search require
+# coordinates and are quality-enhancing but not strictly necessary
 CORE_TOOLS_BY_TYPE = {
     "intercity": set(),  # No core tools; REQUIRES_TRANSPORT + 60% threshold sufficient
-    "multiday": {"poi_search", "direction"},
-    "hybrid": {"poi_search", "direction"},
-    "single_poi": {"poi_search", "around_search"},
-    "food_tour": {"poi_search", "around_search"},
+    "multiday": {"poi_search"},
+    "hybrid": {"poi_search"},
+    "single_poi": {"poi_search"},
+    "food_tour": {"poi_search"},
     "business": {"poi_search"},
-    "family_study": {"poi_search", "direction"},
+    "family_study": {"poi_search"},
 }
 
 # Transport tools - at least one must be called for transport-related problems
@@ -155,6 +160,17 @@ TRANSPORT_TOOLS = {"search_flights", "search_train_tickets"}
 
 # Problem types that require transport information
 REQUIRES_TRANSPORT = {"intercity", "hybrid", "business"}
+
+# Conflicting constraint pairs (used by DifficultyProfile for constraint injection)
+CONFLICTING_CONSTRAINT_PAIRS = [
+    ("深度体验", "轻松休闲"),
+    ("预算优先", "舒适优先"),
+    ("速度优先", "经济优先"),
+    ("避开人群", "热门景点打卡"),
+    ("公共交通优先", "速度优先"),
+    ("素食要求", "美食探店"),
+    ("不乘坐红眼航班", "经济优先"),
+]
 
 # Difficulty levels
 DIFFICULTY_LEVELS = {
@@ -214,11 +230,11 @@ CODE_SCORE_WEIGHTS = {
 
 # Info consistency threshold: ratio/divisor normalization per category
 # 0.5 means 50%+ overlap per category = full score (was 0.3)
-INFO_CONSISTENCY_RATIO_DIVISOR = 0.5
+INFO_CONSISTENCY_RATIO_DIVISOR = 0.6
 
 # Minimum category breadth: if fewer than this many categories matched
 # AND total categories >= MIN_BREADTH_TOTAL, apply 0.5x penalty
-INFO_CONSISTENCY_MIN_BREADTH = 3
+INFO_CONSISTENCY_MIN_BREADTH = 4
 INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 4
 
 # Fabrication penalty (deducted from code score)
@@ -227,7 +243,7 @@ FABRICATION_PENALTY_MAX = -17.5
 # Hard constraint penalty multipliers for soft constraints
 # 0.0 = hard fail (total score = 0), 0.5 = 50% penalty, 1.0 = no penalty
 HARD_CONSTRAINT_PENALTIES = {
-    "format_valid": 0.0,            # Hard fail - output is garbage/off-topic
+    "format_valid": 0.15,           # Near-fail — output is garbage/off-topic but gives RL gradient
     "tool_info_used": 0.0,          # Hard fail - anti-hack
     "required_tools_called": 0.5,   # Soft - missing tools gets 50% penalty
     "poi_names_verified": 0.7,      # Soft - POI mismatch gets 30% penalty
@@ -237,7 +253,7 @@ HARD_CONSTRAINT_PENALTIES = {
 
 # LLM-code smooth coupling factor
 # llm_score *= min(1.0, code_total / (TOTAL_CODE_SCORE * factor))
-LLM_CODE_RATIO_FACTOR = 0.6
+LLM_CODE_RATIO_FACTOR = 0.75
 
 # LLM score weights (max 30) - reduced from 40 for RL safety
 LLM_SCORE_WEIGHTS = {
@@ -479,7 +495,7 @@ TOOLS_SCHEMA = [
                         "description": "到达城市经度"
                     }
                 },
-                "required": ["date", "from_city", "to_city", "from_city_adcode", "to_city_adcode", "from_lat", "from_lon", "to_lat", "to_lon"]
+                "required": ["date", "from_city", "to_city"]
             }
         }
     }
