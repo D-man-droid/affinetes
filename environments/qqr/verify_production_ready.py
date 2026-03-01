@@ -2,10 +2,11 @@
 """
 QQR Pre-Launch Verification Suite
 
-16 tests across three layers:
+Tests across four layers:
   A-layer: AST structure validation (no imports needed)
   B-layer: Module import tests (scorer/problem_generator)
   C-layer: Mock transport determinism (exec stub bypasses mcp import)
+  D-layer: Scoring hardening verification (anti-inflation fixes)
 """
 
 import ast
@@ -94,18 +95,19 @@ except Exception as e:
     record("A.4", 'search_train_tickets has 6 default="" params', False, str(e))
 
 
-# A.9: env.py step() contains llm_validation_error check and ep.final_score = 0.0
+# A.9: env.py step() uses score_result.total + sets error when LLM unavailable
 try:
     _, src = _parse_file("env.py")
     has_check = "score_result.llm_validation_error" in src
-    has_zero = "ep.final_score = 0.0" in src
-    if has_check and has_zero:
-        record("A.9", "env.py step() has llm_validation_error check + score=0", True)
+    has_total = "score_result.total" in src
+    has_error_field = 'ep.score_breakdown["error"]' in src
+    if has_check and has_total and has_error_field:
+        record("A.9", "env.py step() uses total + error when LLM unavailable", True)
     else:
-        record("A.9", "env.py step() has llm_validation_error check + score=0", False,
-               f"llm_validation_error check: {has_check}, final_score=0.0: {has_zero}")
+        record("A.9", "env.py step() uses total + error when LLM unavailable", False,
+               f"check={has_check}, total={has_total}, error_field={has_error_field}")
 except Exception as e:
-    record("A.9", "env.py step() has llm_validation_error check + score=0", False, str(e))
+    record("A.9", "env.py step() uses total + error when LLM unavailable", False, str(e))
 
 
 # A.10: env.py evaluate() finally block has only _episodes.pop + gc.collect, no mcp/cleanup
@@ -360,33 +362,33 @@ try:
                f"llm_filled={llm_filled} (prac={result_ok.llm_practicality}), "
                f"code_ran={code_ran}")
 
-    # A.6b: success=False
+    # A.6b: success=False → code-first: code STILL computed, llm=0, error propagated
     scorer_fail = TravelScorer(llm_validator=MockValidator(success=False))
     result_fail = loop.run_until_complete(
         scorer_fail.score(fake_output, problem, fake_tool_trace)
     )
-    code_zero = result_fail.code_total == 0.0
+    code_computed = result_fail.code_total > 0
     llm_zero = result_fail.llm_total == 0.0
     error_propagated = "Mock API failure" in result_fail.llm_validation_error
-    if code_zero and llm_zero and error_propagated:
-        record("A.6b", "MockValidator(success=False) -> early return, scores=0", True)
+    if code_computed and llm_zero and error_propagated:
+        record("A.6b", "MockValidator(success=False) -> code computed, llm=0", True)
     else:
-        record("A.6b", "MockValidator(success=False) -> early return, scores=0", False,
+        record("A.6b", "MockValidator(success=False) -> code computed, llm=0", False,
                f"code={result_fail.code_total}, llm={result_fail.llm_total}, "
                f"error='{result_fail.llm_validation_error}'")
 
-    # A.6c: No LLM validator (llm_validator=None)
+    # A.6c: No LLM validator → code-first: code STILL computed, error set
     scorer_none = TravelScorer(llm_validator=None)
     result_none = loop.run_until_complete(
         scorer_none.score(fake_output, problem, fake_tool_trace)
     )
-    code_zero_c = result_none.code_total == 0.0
+    code_computed_c = result_none.code_total > 0
     llm_zero_c = result_none.llm_total == 0.0
-    has_error = "LLM validator unavailable" in result_none.llm_validation_error
-    if code_zero_c and llm_zero_c and has_error:
-        record("A.6c", "No LLM validator -> early return, error set", True)
+    has_error = "not configured" in result_none.llm_validation_error
+    if code_computed_c and llm_zero_c and has_error:
+        record("A.6c", "No LLM validator -> code computed, error set", True)
     else:
-        record("A.6c", "No LLM validator -> early return, error set", False,
+        record("A.6c", "No LLM validator -> code computed, error set", False,
                f"code={result_none.code_total}, llm={result_none.llm_total}, "
                f"error='{result_none.llm_validation_error}'")
 
@@ -395,9 +397,9 @@ try:
 except Exception as e:
     record("A.6a", "MockValidator(success=True) -> LLM+code scores", False,
            traceback.format_exc())
-    record("A.6b", "MockValidator(success=False) -> early return, scores=0", False,
+    record("A.6b", "MockValidator(success=False) -> code computed, llm=0", False,
            traceback.format_exc())
-    record("A.6c", "No LLM validator -> early return, error set", False,
+    record("A.6c", "No LLM validator -> code computed, error set", False,
            traceback.format_exc())
 
 
@@ -482,6 +484,173 @@ except Exception as e:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  D-LAYER: Scoring Hardening Verification                               ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# D.1: IC minimum quantity gate — 1 match out of 10 tool facts → score < 50%
+try:
+    from scorer import TravelScorer
+    cat_score = TravelScorer._ic_category_score(
+        matched_count=1, tool_count=10, divisor=0.6
+    )
+    # With 10 tool facts, min_required = min(3, ceil(10*0.3)) = 3
+    # 1 < 3 → capped at IC_BELOW_MINIMUM_SCALE * (1/3) = 0.5 * 0.33 = 0.167
+    if cat_score < 0.5:
+        record("D.1", "IC min quantity: 1/10 match → score < 0.5", True,
+               f"cat_score={cat_score:.3f}")
+    else:
+        record("D.1", "IC min quantity: 1/10 match → score < 0.5", False,
+               f"cat_score={cat_score:.3f} (expected < 0.5)")
+except Exception as e:
+    record("D.1", "IC min quantity: 1/10 match → score < 0.5", False,
+           traceback.format_exc())
+
+
+# D.2: IC minimum quantity gate — small tool set (3 facts) not affected
+try:
+    from scorer import TravelScorer
+    cat_score_small = TravelScorer._ic_category_score(
+        matched_count=1, tool_count=3, divisor=0.6
+    )
+    # tool_count=3 < IC_MIN_QUANTITY_THRESHOLD=4 → normal ratio scoring
+    # ratio = 1/3 = 0.333, cat_score = min(1.0, 0.333/0.6) = 0.556
+    if cat_score_small > 0.5:
+        record("D.2", "IC min quantity: small set (3) unaffected", True,
+               f"cat_score={cat_score_small:.3f}")
+    else:
+        record("D.2", "IC min quantity: small set (3) unaffected", False,
+               f"cat_score={cat_score_small:.3f} (expected > 0.5)")
+except Exception as e:
+    record("D.2", "IC min quantity: small set (3) unaffected", False,
+           traceback.format_exc())
+
+
+# D.3: Completeness grounding — keyword+context without tool fact → 0
+try:
+    from scorer import TravelScorer
+    scorer = TravelScorer(llm_validator=None)
+    # keyword matches, context matches, but tool_facts_set is empty
+    result = scorer._check_with_grounded_context(
+        text="景点游览 西湖景区公园 非常推荐",
+        keyword=r'(景点|游览)',
+        context=r'[\u4e00-\u9fa5]{2,}(景区|公园)',
+        tool_facts_set=set(),  # No tool facts
+        max_pts=7.0
+    )
+    if result == 0.0:
+        record("D.3", "No tool fact → completeness = 0", True)
+    else:
+        record("D.3", "No tool fact → completeness = 0", False,
+               f"result={result} (expected 0.0)")
+except Exception as e:
+    record("D.3", "No tool fact → completeness = 0", False,
+           traceback.format_exc())
+
+
+# D.4: Day grounding — 0 matched POIs → 0.0
+try:
+    from scorer import TravelScorer, ExtractedFacts
+    scorer = TravelScorer(llm_validator=None)
+    facts = ExtractedFacts()
+    facts.pois = {"故宫博物院", "天安门广场", "颐和园"}
+    # Output text doesn't contain any of the POIs
+    result = scorer._compute_day_grounding(
+        output_text="第一天 上午游览景点 下午购物",
+        tool_facts=facts,
+        num_days=3
+    )
+    if result == 0.0:
+        record("D.4", "Day grounding: 0 matched POIs → 0.0", True)
+    else:
+        record("D.4", "Day grounding: 0 matched POIs → 0.0", False,
+               f"result={result} (expected 0.0)")
+except Exception as e:
+    record("D.4", "Day grounding: 0 matched POIs → 0.0", False,
+           traceback.format_exc())
+
+
+# D.5: Quantity scaling — no floor, linear scaling
+try:
+    from scorer import TravelScorer
+    scorer = TravelScorer(llm_validator=None)
+    # 1 grounded fact, target_count=4 → should be exactly tier * (1/4) = 0.25
+    result = scorer._check_with_grounded_context(
+        text="景点游览 故宫博物院",
+        keyword=r'(景点|游览)',
+        context=r'不匹配的上下文',  # Context won't match → 50% tier
+        tool_facts_set={"故宫博物院", "天安门广场", "颐和园", "长城"},
+        max_pts=8.0,
+        use_fuzzy=True,
+        target_count=4
+    )
+    # keyword matches, context doesn't match, tool_fact matches → 50% tier
+    # quantity: 1/4 = 0.25 → 8.0 * 0.5 * 0.25 = 1.0
+    expected = 8.0 * 0.5 * (1.0 / 4.0)  # = 1.0
+    if abs(result - expected) < 0.01:
+        record("D.5", "Quantity scaling: linear, no floor", True,
+               f"result={result:.2f}, expected={expected:.2f}")
+    else:
+        record("D.5", "Quantity scaling: linear, no floor", False,
+               f"result={result:.2f}, expected={expected:.2f}")
+except Exception as e:
+    record("D.5", "Quantity scaling: linear, no floor", False,
+           traceback.format_exc())
+
+
+# D.6: IC empty tool_facts — returns < 50% (was 50% before)
+try:
+    from scorer import TravelScorer, ExtractedFacts
+    from parser import get_parser
+    scorer = TravelScorer(llm_validator=None)
+    parser = get_parser()
+    parsed = parser.parse("some output text with content")
+    empty_facts = ExtractedFacts()
+    output_facts = ExtractedFacts()
+    # tool_trace with substantial content
+    tool_trace = [
+        {"name": "poi_search", "arguments": {"address": "故宫"},
+         "result": {"text": "这是一个很长的结果" * 20}}
+    ]
+    ic_score = scorer._score_info_consistency(parsed, tool_trace, empty_facts, output_facts)
+    max_ic = 35.0
+    # Should be max_score * 0.1 = 3.5 (parser failed on substantial data)
+    if ic_score < max_ic * 0.5:
+        record("D.6", "IC empty tool_facts → < 50% (was 50%)", True,
+               f"ic_score={ic_score:.1f}")
+    else:
+        record("D.6", "IC empty tool_facts → < 50% (was 50%)", False,
+               f"ic_score={ic_score:.1f} (expected < {max_ic * 0.5})")
+except Exception as e:
+    record("D.6", "IC empty tool_facts → < 50% (was 50%)", False,
+           traceback.format_exc())
+
+
+# D.7: POI fabrication penalty — tools returned POIs but output uses none
+try:
+    from scorer import ClaimVerifier, ExtractedFacts, HardConstraintChecker
+    verifier = ClaimVerifier()
+    tool_facts = ExtractedFacts()
+    tool_facts.pois = {"故宫博物院", "天安门广场", "颐和园"}
+    output_facts = ExtractedFacts()
+    called_tools = {"poi_search"}
+    # raw_output doesn't contain any tool POIs
+    penalty, violations = verifier.verify_claims(
+        tool_facts, output_facts, called_tools,
+        raw_output="我推荐去一些景点游览，比如随便什么地方"
+    )
+    has_poi_violation = any("No tool POIs" in v for v in violations)
+    if penalty < 0 and has_poi_violation:
+        record("D.7", "POI fabrication: no tool POIs used → penalty", True,
+               f"penalty={penalty}, violations={violations}")
+    else:
+        record("D.7", "POI fabrication: no tool POIs used → penalty", False,
+               f"penalty={penalty}, violations={violations}")
+except Exception as e:
+    record("D.7", "POI fabrication: no tool POIs used → penalty", False,
+           traceback.format_exc())
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  RESULTS OUTPUT                                                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -533,46 +702,47 @@ def print_results():
       | diskcache         | MCP server connect  | server.cleanup()    | /var/lib/qqr/cache/       |
       +-------------------+---------------------+---------------------+---------------------------+
 
-    [2.3] Error Propagation Chain
+    [2.3] Error Propagation Chain (Code-First Architecture)
       LLMValidator.validate() -> LLMValidationResult(success=False, error="...")
-        -> TravelScorer.score() -> result.llm_validation_error = error (early return, code=0)
-        -> Actor.step() -> ep.final_score=0, ep.score_breakdown["error"] = "LLM validator unavailable: ..."
-        -> Actor.evaluate() -> {"score": 0.0, "success": False, "extra": {"score_breakdown": {...}}}
+        -> TravelScorer.score() -> code scores ALWAYS computed; llm_total=0
+        -> Actor.step() -> ep.final_score = score_result.total (code only)
+        -> Actor.evaluate() -> {"score": code_score/100, "extra": {"score_breakdown": {...}}}
 
       No LLM validator (missing API key):
-        -> TravelScorer.score() -> result.llm_validation_error = "LLM validator unavailable"
-        -> Same downstream handling as above (score=0)
+        -> TravelScorer.score() -> code computed, llm_validation_error="not configured"
+        -> Same downstream: total = code_total (max 70)
 
-    [2.4] Scorer Execution Paths
-      +----+------------------------------------+-----------+----------+-------+----------------------------+
-      | P  | Trigger                            | code      | llm      | total | Notes                      |
-      +----+------------------------------------+-----------+----------+-------+----------------------------+
-      | P1 | LLM validator all models fail      | 0 (skip)  | 0 (skip) | 0     | env.py marks invalid       |
-      | P2 | tool_info_used=False               | 0 (skip)  | 0 (skip) | 0     | hard fail multiplier 0.0   |
-      | P3 | LLM ok + format_valid fail         | 0 (skip)  | set      | ~base*0.15 | RL gradient kept      |
-      | P4 | LLM ok + normal flow               | computed  | set      | 0-100 | full scoring               |
-      | P5 | No LLM validator (no API key)      | 0 (skip)  | 0 (skip) | 0     | error field set            |
-      | P6 | Cross-validation anti-cheat fires  | computed  | set      | 0     | tool_info_used overwritten |
-      +----+------------------------------------+-----------+----------+-------+----------------------------+
+    [2.4] Scorer Execution Paths (Code-First)
+      +----+------------------------------------+-----------+----------+---------+---------------------------+
+      | P  | Trigger                            | code      | llm      | total   | Notes                     |
+      +----+------------------------------------+-----------+----------+---------+---------------------------+
+      | P1 | LLM validator all models fail      | computed  | 0        | 0-70    | code-first, LLM optional  |
+      | P2 | tool_info_used=False               | computed  | computed | 0       | hard fail multiplier 0.0  |
+      | P3 | format_valid fail                  | computed  | computed | ~x*0.15 | RL gradient kept          |
+      | P4 | Normal flow (LLM available)        | computed  | set      | 0-100   | full scoring              |
+      | P5 | No LLM validator (no API key)      | computed  | 0        | 0-70    | code-only scoring         |
+      +----+------------------------------------+-----------+----------+---------+---------------------------+
 
-    [2.5] Behavioral Changes vs. Previous Version
-      +--------------------------------------+-----------------------------------+-----------------------------------+
-      | Scenario                             | Old Behavior                      | New Behavior                      |
-      +--------------------------------------+-----------------------------------+-----------------------------------+
-      | Chutes API all timeouts              | DEFAULT scores(15/30) + code      | score=0, error field marked       |
-      | 3 consecutive API failures           | Circuit breaker, all evals -> 0   | Independent retry per evaluation  |
-      | Concurrent eval A finishes           | cleanup MCP, eval B tool fails    | MCP kept alive, B continues       |
-      | Model sends 3 args to train search   | FastMCP param missing error       | Defaults fill in, normal result   |
-      | No CHUTES_API_KEY set                | DEFAULT scores(15/30) + code      | score=0, error field marked       |
-      +--------------------------------------+-----------------------------------+-----------------------------------+
+    [2.5] Anti-Inflation Hardening
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
+      | Weakness                                  | Old Behavior                      | New Behavior                      |
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
+      | IC: 1 fact matches per category            | Full category score (1.0)         | Capped at 50% when below minimum  |
+      | Completeness: keyword+context only         | 15% free credit                   | 0% (requires tool grounding)      |
+      | Quantity scaling floor                     | max(0.25, ratio) → 25% minimum    | Linear: ratio (no floor)          |
+      | Day structure baseline                     | 0.3 base even with 0 POIs         | 0.0 without matched POIs          |
+      | Budget/tips fallback to POI names          | POI names as price proxy → 100%   | 20% structural credit max         |
+      | IC empty tool_facts                        | 50% free score                    | 10-20% based on tool content      |
+      | POI fabrication                            | No check                          | -3.0 penalty when 0 tool POIs used|
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
 
     [2.6] Known Acceptable Risks
       +------------------------------------------+--------+----------------------------------------------+
       | Risk                                     | Sev    | Rationale                                    |
       +------------------------------------------+--------+----------------------------------------------+
       | AsyncOpenAI no explicit close             | Low    | Single instance, container exit reclaims     |
-      | P1/P5 path code scores not computed       | None   | env.py marks invalid, score=0                |
-      | CHUTES_API_KEY required for scoring       | None   | By design; no silent fallback                |
+      | LLM unavailable → max 70 pts             | Low    | Code-first: fair within same eval batch      |
+      | CHUTES_API_KEY required for LLM scoring  | None   | Code scoring works without it                |
       +------------------------------------------+--------+----------------------------------------------+
     """))
 

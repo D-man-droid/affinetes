@@ -16,11 +16,11 @@ Score structure (max 100):
 Anti-hack measures:
 1. Grounded completeness: _check_with_grounded_context requires tool fact presence
    - keyword + context + tool fact → 100%, keyword + tool fact → 50%
-   - keyword + context only → 15%, keyword only → 0% (no credit without grounding)
-   - Quantity scaling: tier_score *= max(0.25, grounded_facts / target_count)
-   - All checks (including budget, tips, business) require tool grounding
-   - Day structure uses graduated POI grounding (0.3 base → 1.0 at target)
-2. Info consistency threshold raised: 60% overlap per category required (was 50%)
+   - No credit without tool grounding (no free tiers)
+   - Quantity scaling: tier_score *= grounded_facts / target_count (linear, no floor)
+   - Budget/tips without price data: max 20% structural credit
+   - Day structure requires matched POIs (no baseline credit)
+2. Info consistency: 60% overlap per category + minimum quantity gate per category
 3. Category breadth: <4 categories matched AND >=4 available → 0.5x penalty
 4. Transport grounding: graduated penalty (0.3x at 100% fabrication)
 5. Epoch salt: weekly rotation of transport data prevents memorization
@@ -53,6 +53,10 @@ from config import (
     CODE_TOOL_USED_COMP_THRESHOLD,
     CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT,
     CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT,
+    IC_MIN_QUANTITY_THRESHOLD,
+    IC_MIN_QUANTITY_RATIO,
+    IC_MIN_QUANTITY_CAP,
+    IC_BELOW_MINIMUM_SCALE,
 )
 from parser import ParsedOutput, get_parser
 from problem_generator import TravelProblem
@@ -737,14 +741,15 @@ class ClaimVerifier:
         self,
         tool_facts: ExtractedFacts,
         output_facts: ExtractedFacts,
-        called_tools: Set[str]
+        called_tools: Set[str],
+        raw_output: str = ""
     ) -> Tuple[float, List[str]]:
         """
         Verify output claims against tool facts.
         Returns (penalty, list of violations).
 
         Note: Flight/train ID verification is handled by TransportGroundingVerifier.
-        This method only verifies prices, weather, and other non-ID claims.
+        This method verifies prices, weather, and POI claims.
         """
         penalty = 0.0
         violations = []
@@ -761,6 +766,20 @@ class ClaimVerifier:
                 if fabricated_weather:
                     penalty += -2.0
                     violations.append(f"Fabricated weather: {fabricated_weather}")
+
+        # 3. Verify POI claims — penalize when POI tools returned data
+        #    but output uses none of the tool-provided POI names
+        poi_tools = {"poi_search", "around_search"}
+        if (called_tools & poi_tools) and len(tool_facts.pois) >= 3 and raw_output:
+            matched = sum(
+                1 for poi in tool_facts.pois
+                if HardConstraintChecker._fuzzy_poi_match(poi, raw_output)
+            )
+            if matched == 0:
+                penalty += -3.0
+                violations.append(
+                    f"No tool POIs used despite {len(tool_facts.pois)} available"
+                )
 
         return max(FABRICATION_PENALTY_MAX, penalty), violations
 
@@ -865,10 +884,15 @@ class HardConstraintChecker:
         norm_output = HardConstraintChecker._normalize_text(output_text)
         if len(norm_poi) >= 2 and norm_poi in norm_output:
             return True
-        # Partial match for long names (>= 4 chars)
-        if len(poi_name) >= 4:
-            half_len = len(poi_name) // 2
-            if poi_name[:half_len] in output_text or poi_name[half_len:] in output_text:
+        # Partial match for long names: require fragment >= 5 chars to avoid
+        # generic category words (e.g. "酒店", "餐厅", "景区") matching
+        # against tool POIs like "英明商务酒店" → "务酒店" false positive.
+        if len(poi_name) >= 10:
+            frag_len = len(poi_name) // 2
+            first, second = poi_name[:frag_len], poi_name[frag_len:]
+            if len(first) >= 5 and first in output_text:
+                return True
+            if len(second) >= 5 and second in output_text:
                 return True
         return False
 
@@ -1008,7 +1032,7 @@ class TravelScorer:
 
         # 3. Fabrication penalty (always computed)
         penalty, violations = self._claim_verifier.verify_claims(
-            tool_facts, output_facts, called_tools
+            tool_facts, output_facts, called_tools, raw_output=raw_output
         )
 
         max_consistency = CODE_SCORE_WEIGHTS.get("info_consistency", 35.0)
@@ -1129,6 +1153,34 @@ class TravelScorer:
             return len(result) > 10 and not is_error_response(result)
         return bool(result)
 
+    @staticmethod
+    def _ic_category_score(matched_count: int, tool_count: int, divisor: float) -> float:
+        """Compute IC score for a single category with minimum quantity gate.
+
+        When tool returns >= IC_MIN_QUANTITY_THRESHOLD facts, require at least
+        min(IC_MIN_QUANTITY_CAP, ceil(tool_count * IC_MIN_QUANTITY_RATIO)) matches.
+        Below minimum: cap category score at IC_BELOW_MINIMUM_SCALE.
+        """
+        if matched_count <= 0:
+            return 0.0
+        ratio = matched_count / tool_count
+        base_score = min(1.0, ratio / divisor)
+
+        if tool_count >= IC_MIN_QUANTITY_THRESHOLD:
+            min_required = min(IC_MIN_QUANTITY_CAP, max(1, -(-int(tool_count * IC_MIN_QUANTITY_RATIO) // 1)))
+            if matched_count < min_required:
+                base_score = min(IC_BELOW_MINIMUM_SCALE, (matched_count / min_required) * IC_BELOW_MINIMUM_SCALE)
+
+        return base_score
+
+    @staticmethod
+    def _get_tool_result_text(call: Dict) -> str:
+        """Extract text from a tool trace entry for length checking."""
+        result = call.get("result", {})
+        if isinstance(result, dict):
+            return result.get("text", "")
+        return str(result) if result else ""
+
     def _score_info_consistency(
         self, parsed: ParsedOutput, tool_trace: List[Dict],
         tool_facts: ExtractedFacts, output_facts: ExtractedFacts
@@ -1138,20 +1190,27 @@ class TravelScorer:
         if not tool_trace:
             return 0.0
         if tool_facts.is_empty():
-            return max_score * 0.5
+            # Tools called but no facts extracted — distinguish parser failure from API failure
+            any_substantial = any(
+                len(self._get_tool_result_text(call)) > 50
+                for call in tool_trace if call.get("result")
+            )
+            if any_substantial:
+                return max_score * 0.1  # Parser failed on substantial data
+            else:
+                return max_score * 0.2  # Tools returned errors/empty
 
         output_text = parsed.raw_text
         matches = 0.0
         total = 0
         categories_matched = 0
 
-        # Ratio-based scoring: score proportional to overlap
+        # Ratio-based scoring with minimum quantity gate
         if tool_facts.flights:
             total += 1
             overlap = tool_facts.flights & output_facts.flights
             if overlap:
-                ratio = len(overlap) / min(len(tool_facts.flights), max(1, len(output_facts.flights)))
-                cat_score = min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_facts.flights), divisor)
                 matches += cat_score
                 categories_matched += 1
 
@@ -1159,8 +1218,7 @@ class TravelScorer:
             total += 1
             overlap = tool_facts.trains & output_facts.trains
             if overlap:
-                ratio = len(overlap) / min(len(tool_facts.trains), max(1, len(output_facts.trains)))
-                cat_score = min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_facts.trains), divisor)
                 matches += cat_score
                 categories_matched += 1
 
@@ -1171,8 +1229,7 @@ class TravelScorer:
                 if HardConstraintChecker._fuzzy_poi_match(poi, output_text)
             )
             if matched_pois > 0:
-                ratio = matched_pois / len(tool_facts.pois)
-                cat_score = min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(matched_pois, len(tool_facts.pois), divisor)
                 matches += cat_score
                 categories_matched += 1
 
@@ -1180,24 +1237,23 @@ class TravelScorer:
             total += 1
             overlap = tool_facts.weather & output_facts.weather
             if overlap:
-                ratio = len(overlap) / len(tool_facts.weather)
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_facts.weather), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if tool_facts.distances:
             total += 1
             matched_dist = sum(1 for d in tool_facts.distances if d in output_text)
             if matched_dist > 0:
-                ratio = matched_dist / max(1, len(tool_facts.distances))
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(matched_dist, len(tool_facts.distances), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if tool_facts.times:
             total += 1
             overlap = tool_facts.times & output_facts.times
             if overlap:
-                ratio = len(overlap) / min(len(tool_facts.times), max(1, len(output_facts.times)))
-                cat_score = min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_facts.times), divisor)
                 matches += cat_score
                 categories_matched += 1
 
@@ -1207,32 +1263,32 @@ class TravelScorer:
             output_price_values = set(str(p) for p in output_facts.prices.values())
             overlap = tool_price_values & output_price_values
             if overlap:
-                ratio = len(overlap) / len(tool_price_values)
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_price_values), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if tool_facts.wind_info:
             total += 1
             overlap = tool_facts.wind_info & output_facts.wind_info
             if overlap:
-                ratio = len(overlap) / len(tool_facts.wind_info)
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(len(overlap), len(tool_facts.wind_info), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if tool_facts.travel_durations:
             total += 1
             matched_dur = sum(1 for d in tool_facts.travel_durations if d in output_text)
             if matched_dur > 0:
-                ratio = matched_dur / max(1, len(tool_facts.travel_durations))
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(matched_dur, len(tool_facts.travel_durations), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if tool_facts.road_names:
             total += 1
             matched_roads = sum(1 for road in tool_facts.road_names if road in output_text)
             if matched_roads > 0:
-                ratio = matched_roads / len(tool_facts.road_names)
-                matches += min(1.0, ratio / divisor)
+                cat_score = self._ic_category_score(matched_roads, len(tool_facts.road_names), divisor)
+                matches += cat_score
                 categories_matched += 1
 
         if total == 0:
@@ -1292,7 +1348,7 @@ class TravelScorer:
         if target_count > 0:
             matched = self._count_verified_ids(text, verified_ids)
             quantity_ratio = min(1.0, matched / target_count)
-            base_score *= max(0.25, quantity_ratio)
+            base_score *= quantity_ratio  # Linear scaling, no floor
 
         return base_score
 
@@ -1306,12 +1362,10 @@ class TravelScorer:
         Scoring tiers (anti-hack hardened):
         - keyword + context + tool fact → full points
         - keyword + tool fact only → 50% (grounded, sparse structure)
-        - keyword + context only → 15% (structure present, not grounded — gameable)
-        - keyword only → 0% (no credit without evidence)
+        - anything else → 0% (no credit without tool grounding)
 
         Quantity scaling (when target_count > 0):
-        - After tier scoring, scale by grounded_facts / target_count
-        - Floor at 25% to avoid complete zeroing
+        - After tier scoring, scale linearly by grounded_facts / target_count
 
         Args:
             text: Output text to check
@@ -1344,16 +1398,14 @@ class TravelScorer:
             tier_score = max_pts
         elif has_kw and has_tool_fact:
             tier_score = max_pts * 0.5
-        elif has_kw and has_ctx:
-            tier_score = max_pts * 0.15
         else:
-            return 0.0
+            return 0.0  # No tool grounding = no credit
 
-        # Quantity scaling: target_count > 0 → scale by actual hits / target
+        # Quantity scaling: target_count > 0 → scale linearly by actual hits / target
         if target_count > 0 and tier_score > 0:
             grounded = self._count_grounded_facts(text, tool_facts_set, use_fuzzy)
             quantity_ratio = min(1.0, grounded / target_count)
-            tier_score *= max(0.25, quantity_ratio)
+            tier_score *= quantity_ratio  # Linear scaling, no floor
 
         return tier_score
 
@@ -1415,12 +1467,17 @@ class TravelScorer:
         return targets.get(problem.problem_type, {})
 
     def _compute_day_grounding(self, output_text: str, tool_facts: ExtractedFacts, num_days: int) -> float:
-        """Compute graduated day grounding based on POI count in output."""
+        """Compute graduated day grounding based on POI count in output.
+
+        No baseline: day structure without matched POIs earns nothing.
+        """
         if tool_facts.pois:
             poi_in_days = sum(1 for p in tool_facts.pois if p and p.lower() in output_text)
+            if poi_in_days == 0:
+                return 0.0  # No matched POIs = no day grounding credit
             target_pois = min(4, max(2, num_days))
-            return 0.3 + 0.7 * min(1.0, poi_in_days / target_pois)
-        return 0.3
+            return min(1.0, poi_in_days / target_pois)
+        return 0.0  # No POI data = no grounding possible
 
     def _score_completeness(self, parsed: ParsedOutput, problem: TravelProblem, tool_facts: ExtractedFacts) -> float:
         max_score = CODE_SCORE_WEIGHTS.get("completeness", 35.0)
@@ -1453,9 +1510,12 @@ class TravelScorer:
             score += self._check_with_grounded_context(output_text, r'(餐|吃|美食)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜|面|粉|饭)', tool_facts.pois, 6.0, use_fuzzy=True, target_count=targets.get("dining", 0))
             score += self._check_with_grounded_context(output_text, r'(住宿|酒店|宾馆)', r'([\u4e00-\u9fa5]{2,}(酒店|宾馆|民宿|客栈)|[三四五]星)', tool_facts.pois, 5.0, use_fuzzy=True, target_count=targets.get("lodging", 0))
             score += self._check_with_grounded_context(output_text, r'(交通|出行)', r'(打车|地铁|公交|步行|骑行|\d+路|\d+号线)', distance_strs | duration_strs, 5.0, target_count=targets.get("transport_info", 0))
-            # multiday has no transport tools → price_strs empty; ground with available facts
-            budget_facts = price_strs if price_strs else (tool_facts.pois | distance_strs | duration_strs)
-            score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', budget_facts, 5.0, use_fuzzy=bool(not price_strs), target_count=targets.get("budget_items", 0))
+            # Budget: require price data for full grounding; structural credit only without
+            if price_strs:
+                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 5.0, target_count=targets.get("budget_items", 0))
+            else:
+                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
+                    score += 5.0 * 0.2
 
         elif problem.problem_type == "hybrid":
             # transport (8) + days (7) + attractions (6) + dining (5) + budget (5) + weather (4) = 35
@@ -1475,20 +1535,30 @@ class TravelScorer:
             score += self._check_with_grounded_context(output_text, r'(游览|路线|安排)', r'(上午|下午|时间|小时)', tool_facts.pois, 8.0, use_fuzzy=True, target_count=targets.get("visit_items", 0))
             score += self._check_with_grounded_context(output_text, r'(周边|附近)', r'[\u4e00-\u9fa5]{2,}(餐厅|咖啡|店|馆)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("nearby", 0))
             score += self._check_with_grounded_context(output_text, r'(交通|距离|步行)', r'(\d+\s*(米|公里|分钟))', distance_strs | duration_strs, 7.0, target_count=targets.get("transport_info", 0))
-            # single_poi has no transport tools → price_strs/time_strs empty; ground with available facts
-            tips_facts = (price_strs | time_strs) if (price_strs or time_strs) else (tool_facts.pois | distance_strs | duration_strs)
-            score += self._check_with_grounded_context(output_text, r'(门票|开放|注意|建议)', r'(元|\d+:\d+|提前|携带)', tips_facts, 7.0, use_fuzzy=bool(not price_strs and not time_strs), target_count=targets.get("tips", 0))
-            budget_facts = price_strs if price_strs else (tool_facts.pois | distance_strs | duration_strs)
-            score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', budget_facts, 6.0, use_fuzzy=bool(not price_strs), target_count=targets.get("budget_items", 0))
+            # Tips: require price/time data for full grounding
+            if price_strs or time_strs:
+                score += self._check_with_grounded_context(output_text, r'(门票|开放|注意|建议)', r'(元|\d+:\d+|提前|携带)', price_strs | time_strs, 7.0, target_count=targets.get("tips", 0))
+            else:
+                if bool(re.search(r'(门票|开放|注意|建议)', output_text)) and bool(re.search(r'(元|\d+:\d+|提前|携带)', output_text)):
+                    score += 7.0 * 0.2
+            # Budget: require price data for full grounding
+            if price_strs:
+                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 6.0, target_count=targets.get("budget_items", 0))
+            else:
+                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
+                    score += 6.0 * 0.2
 
         elif problem.problem_type == "food_tour":
             # restaurants (8) + recommendations (7) + route (7) + cost (7) + tips (6) = 35
             score += self._check_with_grounded_context(output_text, r'(美食|特色|小吃)', r'[\u4e00-\u9fa5]{2,}(店|馆|摊|铺|坊)', tool_facts.pois, 8.0, use_fuzzy=True, target_count=targets.get("restaurants", 0))
             score += self._check_with_grounded_context(output_text, r'(推荐|必吃|招牌)', r'[\u4e00-\u9fa5]{2,}', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("dishes", 0))
             score += self._check_with_grounded_context(output_text, r'(路线|顺序|区域)', r'(先|然后|接着|最后|步行|打车)', distance_strs | duration_strs, 7.0, target_count=targets.get("route_items", 0))
-            # food_tour has no transport tools → price_strs empty; ground with available facts
-            cost_facts = price_strs if price_strs else (tool_facts.pois | distance_strs)
-            score += self._check_with_grounded_context(output_text, r'(花费|人均|价格)', r'\d+\s*元', cost_facts, 7.0, use_fuzzy=bool(not price_strs), target_count=targets.get("cost_items", 0))
+            # Cost: require price data for full grounding
+            if price_strs:
+                score += self._check_with_grounded_context(output_text, r'(花费|人均|价格)', r'\d+\s*元', price_strs, 7.0, target_count=targets.get("cost_items", 0))
+            else:
+                if bool(re.search(r'(花费|人均|价格)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
+                    score += 7.0 * 0.2
             score += self._check_with_grounded_context(output_text, r'(建议|注意|小贴士)', r'(时间|排队|预约|人多|季节)', tool_facts.pois | tool_facts.weather, 6.0, use_fuzzy=True, target_count=targets.get("tips", 0))
 
         elif problem.problem_type == "business":
@@ -1509,8 +1579,11 @@ class TravelScorer:
             score += self._check_with_grounded_context(output_text, r'(亲子|儿童|孩子)', r'(适合|体力|休息|互动)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("child_items", 0))
             score += self._check_with_grounded_context(output_text, r'(学习|教育|体验)', r'[\u4e00-\u9fa5]{2,}(馆|园|基地|中心)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("education", 0))
             score += self._check_with_grounded_context(output_text, r'(餐厅|住宿)', r'(亲子|家庭|儿童)', tool_facts.pois, 7.0, use_fuzzy=True, target_count=targets.get("dining", 0))
-            # family_study has no transport tools → price_strs empty; ground with available facts
-            budget_facts = price_strs if price_strs else (tool_facts.pois | distance_strs | duration_strs)
-            score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', budget_facts, 7.0, use_fuzzy=bool(not price_strs), target_count=targets.get("budget_items", 0))
+            # Budget: require price data for full grounding
+            if price_strs:
+                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 7.0, target_count=targets.get("budget_items", 0))
+            else:
+                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
+                    score += 7.0 * 0.2
 
         return min(max_score, round(score, 2))

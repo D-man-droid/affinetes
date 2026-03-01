@@ -141,6 +141,13 @@ CONFLICTING_CONSTRAINT_PAIRS = [
 # Anti-memorization: require minimum info consistency ratio
 INFO_CONSISTENCY_MIN_RATIO = 0.4  # Must use at least 40% of available tool info
 
+# IC minimum quantity gate: when tool returns many facts per category,
+# require a proportional number of matches (not just 1)
+IC_MIN_QUANTITY_THRESHOLD = 4   # Only apply when tool has >= 4 facts in category
+IC_MIN_QUANTITY_RATIO = 0.3     # Require matching at least 30% of tool facts
+IC_MIN_QUANTITY_CAP = 3         # Never require more than 3 matches per category
+IC_BELOW_MINIMUM_SCALE = 0.5   # Cap category score at 50% when below minimum
+
 # Code-determined tool_info_used thresholds
 # IC/Comp are based on epoch-salted fact overlap — not forgeable
 # Production data: genuine tool use → IC≈25, Comp≈29; fabricated → IC≈0, Comp≈0
