@@ -148,13 +148,23 @@ IC_MIN_QUANTITY_RATIO = 0.3     # Require matching at least 30% of tool facts
 IC_MIN_QUANTITY_CAP = 3         # Never require more than 3 matches per category
 IC_BELOW_MINIMUM_SCALE = 0.5   # Cap category score at 50% when below minimum
 
+# Format validation thresholds
+FORMAT_MIN_LENGTH = 200         # Minimum output length (chars) for valid format
+
+# Anti-echo: Tier-2 proximity and structural credit
+TIER2_PROXIMITY_DISTANCE = 500    # Max chars between keyword and fact for Tier-2 half-score
+STRUCTURAL_CREDIT_RATIO = 0.1    # Structural credit without tool data (was 0.2)
+
+# IC context-sensitive matching
+IC_OUT_OF_CONTEXT_WEIGHT = 0.5    # Weight for facts not near relevant context keywords
+
 # Code-determined tool_info_used thresholds
 # IC/Comp are based on epoch-salted fact overlap — not forgeable
 # Production data: genuine tool use → IC≈25, Comp≈29; fabricated → IC≈0, Comp≈0
-CODE_TOOL_USED_IC_THRESHOLD = 5.0           # Transport types (intercity, hybrid, business)
-CODE_TOOL_USED_COMP_THRESHOLD = 5.0         # Transport types
-CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT = 3.0   # Non-transport (fewer verifiable categories)
-CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT = 3.0
+CODE_TOOL_USED_IC_THRESHOLD = 6.0           # Transport types (intercity, hybrid, business)
+CODE_TOOL_USED_COMP_THRESHOLD = 6.0         # Transport types
+CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT = 4.0   # Non-transport (fewer verifiable categories)
+CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT = 4.0
 
 # Anti-memorization: require specific POI names from tools
 ENABLE_POI_VERIFICATION = True
@@ -183,13 +193,13 @@ TRANSPORT_GROUNDING_CONFIG = {
     "max_transport_fabrication_ratio": 0.2,  # Max 20% unverified transport claims
 }
 
-# Code score weights (max 70) - tool_coverage/validity are gating prerequisites (0 points)
+# Code score weights (max 50) - tool_coverage/validity are gating prerequisites (0 points)
 # All scoring weight on info_consistency + completeness (the hard, grounding-based dimensions)
 CODE_SCORE_WEIGHTS = {
     "tool_coverage": 0.0,
     "tool_validity": 0.0,
-    "info_consistency": 35.0,
-    "completeness": 35.0,
+    "info_consistency": 25.0,
+    "completeness": 25.0,
 }
 
 # Info consistency threshold: ratio/divisor normalization per category
@@ -197,11 +207,12 @@ CODE_SCORE_WEIGHTS = {
 INFO_CONSISTENCY_RATIO_DIVISOR = 0.6
 
 # Minimum category breadth: if fewer than this many categories matched
-# AND total categories >= MIN_BREADTH_TOTAL, apply 0.5x penalty
-INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 4
+# AND total categories >= MIN_BREADTH_TOTAL, apply breadth penalty
+INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 3
+IC_BREADTH_PENALTY_MULTIPLIER = 0.3  # Harsh penalty for narrow category coverage
 
-# Fabrication penalty (deducted from code score)
-FABRICATION_PENALTY_MAX = -17.5
+# Fabrication penalty (deducted from code score, 25% of code max)
+FABRICATION_PENALTY_MAX = -12.5
 
 # Hard constraint penalty multipliers for soft constraints
 # 0.0 = hard fail (total score = 0), 0.5 = 50% penalty, 1.0 = no penalty
@@ -218,12 +229,13 @@ HARD_CONSTRAINT_PENALTIES = {
 # llm_score *= min(1.0, code_total / (TOTAL_CODE_SCORE * factor))
 LLM_CODE_RATIO_FACTOR = 0.75
 
-# LLM score weights (max 30) - reduced from 40 for RL safety
+# LLM score weights (max 50) - elevated to 50/50 split for anti-hack
+# "analysis_depth" replaces "informativeness" to penalize data-dumping
 LLM_SCORE_WEIGHTS = {
-    "practicality": 7.5,
-    "informativeness": 7.5,
-    "logic": 7.5,
-    "user_experience": 7.5,
+    "practicality": 12.5,
+    "logic": 12.5,
+    "user_experience": 12.5,
+    "analysis_depth": 12.5,
 }
 
 # Total scores

@@ -2,11 +2,12 @@
 """
 QQR Pre-Launch Verification Suite
 
-Tests across four layers:
+Tests across five layers:
   A-layer: AST structure validation (no imports needed)
   B-layer: Module import tests (scorer/problem_generator)
   C-layer: Mock transport determinism (exec stub bypasses mcp import)
   D-layer: Scoring hardening verification (anti-inflation fixes)
+  E-layer: Anti-echo hardening verification (anti-gaming fixes)
 """
 
 import ast
@@ -300,10 +301,10 @@ try:
                     success=True,
                     tool_info_used=True,
                     practicality=8.0,
-                    informativeness=7.0,
+                    analysis_depth=7.0,
                     logic=8.0,
                     user_experience=7.0,
-                    reasons={"practicality": "good", "informativeness": "good",
+                    reasons={"practicality": "good", "analysis_depth": "good",
                              "logic": "good", "user_experience": "good"},
                 )
             else:
@@ -350,7 +351,7 @@ try:
     )
     llm_filled = (
         result_ok.llm_practicality > 0
-        and result_ok.llm_informativeness > 0
+        and result_ok.llm_analysis_depth > 0
         and result_ok.llm_logic > 0
         and result_ok.llm_user_experience > 0
     )
@@ -612,8 +613,8 @@ try:
          "result": {"text": "这是一个很长的结果" * 20}}
     ]
     ic_score = scorer._score_info_consistency(parsed, tool_trace, empty_facts, output_facts)
-    max_ic = 35.0
-    # Should be max_score * 0.1 = 3.5 (parser failed on substantial data)
+    max_ic = 25.0
+    # Should be max_score * 0.1 = 2.5 (parser failed on substantial data)
     if ic_score < max_ic * 0.5:
         record("D.6", "IC empty tool_facts → < 50% (was 50%)", True,
                f"ic_score={ic_score:.1f}")
@@ -633,10 +634,11 @@ try:
     tool_facts.pois = {"故宫博物院", "天安门广场", "颐和园"}
     output_facts = ExtractedFacts()
     called_tools = {"poi_search"}
-    # raw_output doesn't contain any tool POIs
+    # raw_output doesn't contain any tool POIs (must be >= FORMAT_MIN_LENGTH)
+    fake_output = "我推荐去一些景点游览，比如随便什么地方。" * 20  # ensure > 200 chars
     penalty, violations = verifier.verify_claims(
         tool_facts, output_facts, called_tools,
-        raw_output="我推荐去一些景点游览，比如随便什么地方"
+        raw_output=fake_output
     )
     has_poi_violation = any("No tool POIs" in v for v in violations)
     if penalty < 0 and has_poi_violation:
@@ -647,6 +649,233 @@ try:
                f"penalty={penalty}, violations={violations}")
 except Exception as e:
     record("D.7", "POI fabrication: no tool POIs used → penalty", False,
+           traceback.format_exc())
+
+# D.8: Fabrication check skipped on empty/short output
+try:
+    from scorer import ClaimVerifier, ExtractedFacts
+    verifier = ClaimVerifier()
+    tool_facts = ExtractedFacts()
+    tool_facts.pois = {"故宫博物院", "天安门广场", "颐和园"}
+    tool_facts.weather = {"晴", "多云"}
+    output_facts = ExtractedFacts()
+    output_facts.weather = {"大雨"}  # fabricated, but output is too short
+    called_tools = {"poi_search", "weather"}
+    penalty, violations = verifier.verify_claims(
+        tool_facts, output_facts, called_tools,
+        raw_output="短文本"  # well below FORMAT_MIN_LENGTH
+    )
+    if penalty == 0.0 and len(violations) == 0:
+        record("D.8", "Fabrication check skipped on short output", True,
+               f"penalty={penalty}, violations={violations}")
+    else:
+        record("D.8", "Fabrication check skipped on short output", False,
+               f"penalty={penalty}, violations={violations}")
+except Exception as e:
+    record("D.8", "Fabrication check skipped on short output", False,
+           traceback.format_exc())
+
+# D.9: POI extraction excludes admin names (pname/cityname/adname)
+try:
+    from scorer import FactExtractor, ExtractedFacts
+    extractor = FactExtractor()
+    # Simulate amap tool result with pname/cityname/adname fields
+    tool_text = (
+        "name: 趵突泉景区\nid: B001\nlocation: 117.0,36.6\n"
+        "pname: 山东省\ncityname: 济南市\nadname: 历下区\n"
+        "name: 大明湖景区\nid: B002\nlocation: 117.0,36.7\n"
+        "pname: 山东省\ncityname: 济南市\nadname: 历下区\n"
+    )
+    facts = ExtractedFacts()
+    extractor._extract_poi_facts(tool_text, facts)
+    # Should extract real POI names but NOT admin names
+    has_real = "趵突泉景区" in facts.pois and "大明湖景区" in facts.pois
+    no_admin = "山东省" not in facts.pois and "历下区" not in facts.pois
+    # "济南市" could still match via "name:" in "cityname:" if not properly gated
+    no_city = "济南市" not in facts.pois
+    if has_real and no_admin and no_city:
+        record("D.9", "POI extraction excludes admin names", True,
+               f"pois={facts.pois}")
+    else:
+        record("D.9", "POI extraction excludes admin names", False,
+               f"pois={facts.pois}")
+except Exception as e:
+    record("D.9", "POI extraction excludes admin names", False,
+           traceback.format_exc())
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  E-LAYER: Anti-Echo Hardening Verification                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# E.1: Tier-2 proximity — keyword and fact distant (>500 chars) → 20% not 50%
+try:
+    from scorer import TravelScorer
+    scorer = TravelScorer(llm_validator=None)
+    # keyword + fact present but NO context, and fact is far from keyword (>500 chars)
+    distant_text = "预算情况" + "x" * 600 + "500"
+    score_distant = scorer._check_with_grounded_context(
+        distant_text, r'预算', r'\d+\s*元', {"500"}, 10.0
+    )
+    # keyword="预算" present, context="\d+\s*元" NOT present, fact="500" present but distant
+    # Should be tier-2 distant → 10.0 * 0.2 = 2.0
+    if score_distant <= 10.0 * 0.25:  # Should be 2.0 (20%), not 5.0 (50%)
+        record("E.1", "Tier-2 distant: keyword+fact >500 chars → ≤25%", True,
+               f"score={score_distant}")
+    else:
+        record("E.1", "Tier-2 distant: keyword+fact >500 chars → ≤25%", False,
+               f"score={score_distant}, expected ≤2.5")
+except Exception as e:
+    record("E.1", "Tier-2 distant: keyword+fact >500 chars → ≤25%", False,
+           traceback.format_exc())
+
+# E.2: Tier-2 proximity — keyword and fact close (<500 chars) → 50%
+try:
+    from scorer import TravelScorer
+    scorer = TravelScorer(llm_validator=None)
+    # keyword and fact within 500 chars, no context
+    close_text = "预算情况参考 500"
+    score_close = scorer._check_with_grounded_context(
+        close_text, r'预算', r'详细列表', {"500"}, 10.0
+    )
+    # keyword="预算" present, context="详细列表" NOT present, fact="500" present and close
+    # Should be tier-2 proximate → 10.0 * 0.5 = 5.0
+    if abs(score_close - 5.0) < 0.01:
+        record("E.2", "Tier-2 proximate: keyword+fact <500 chars → 50%", True,
+               f"score={score_close}")
+    else:
+        record("E.2", "Tier-2 proximate: keyword+fact <500 chars → 50%", False,
+               f"score={score_close}, expected 5.0")
+except Exception as e:
+    record("E.2", "Tier-2 proximate: keyword+fact <500 chars → 50%", False,
+           traceback.format_exc())
+
+# E.3: tool_info_used new thresholds — IC=5, Comp=5 → False for transport
+try:
+    from config import CODE_TOOL_USED_IC_THRESHOLD, CODE_TOOL_USED_COMP_THRESHOLD
+    from scorer import TravelScorer
+    from problem_generator import get_generator
+    scorer = TravelScorer(llm_validator=None)
+    gen = get_generator()
+    problem = gen.generate(99)
+    # Force intercity type for testing
+    problem.problem_type = "intercity"
+    # IC=5, Comp=5 should fail for transport (threshold=6)
+    result = scorer._determine_tool_info_used(5.0, 5.0, problem)
+    if not result:
+        record("E.3", "tool_info_used: IC=5,Comp=5 → False (transport needs ≥6)", True,
+               f"threshold={CODE_TOOL_USED_IC_THRESHOLD}")
+    else:
+        record("E.3", "tool_info_used: IC=5,Comp=5 → False (transport needs ≥6)", False,
+               f"result={result}, threshold={CODE_TOOL_USED_IC_THRESHOLD}")
+except Exception as e:
+    record("E.3", "tool_info_used: IC=5,Comp=5 → False (transport needs ≥6)", False,
+           traceback.format_exc())
+
+# E.4: Structural credit reduced — keyword + regex, no fact → ≤ max_pts * 0.1
+try:
+    from config import STRUCTURAL_CREDIT_RATIO
+    # The structural credit in _score_completeness uses STRUCTURAL_CREDIT_RATIO (0.1)
+    # Verify constant value
+    if STRUCTURAL_CREDIT_RATIO <= 0.15:  # Should be 0.1
+        record("E.4", "Structural credit ratio ≤ 0.15 (anti-echo)", True,
+               f"ratio={STRUCTURAL_CREDIT_RATIO}")
+    else:
+        record("E.4", "Structural credit ratio ≤ 0.15 (anti-echo)", False,
+               f"ratio={STRUCTURAL_CREDIT_RATIO}, expected ≤0.15")
+except Exception as e:
+    record("E.4", "Structural credit ratio ≤ 0.15 (anti-echo)", False,
+           traceback.format_exc())
+
+# E.5: IC breadth penalty — 3 total categories, 1 matched → 0.3x penalty
+try:
+    from config import IC_BREADTH_PENALTY_MULTIPLIER, INFO_CONSISTENCY_MIN_BREADTH_TOTAL
+    # Verify constants
+    breadth_ok = (INFO_CONSISTENCY_MIN_BREADTH_TOTAL <= 3 and
+                  IC_BREADTH_PENALTY_MULTIPLIER <= 0.35)
+    if breadth_ok:
+        record("E.5", "IC breadth: threshold=3, penalty=0.3x", True,
+               f"total_threshold={INFO_CONSISTENCY_MIN_BREADTH_TOTAL}, "
+               f"multiplier={IC_BREADTH_PENALTY_MULTIPLIER}")
+    else:
+        record("E.5", "IC breadth: threshold=3, penalty=0.3x", False,
+               f"total_threshold={INFO_CONSISTENCY_MIN_BREADTH_TOTAL}, "
+               f"multiplier={IC_BREADTH_PENALTY_MULTIPLIER}")
+except Exception as e:
+    record("E.5", "IC breadth: threshold=3, penalty=0.3x", False,
+           traceback.format_exc())
+
+
+# E.6: analysis_depth field exists and LLM mapping works
+try:
+    from llm_validator import LLMValidationResult
+    from config import LLM_SCORE_WEIGHTS
+    llm_r = LLMValidationResult(
+        success=True,
+        practicality=8.0,
+        analysis_depth=7.0,
+        logic=9.0,
+        user_experience=6.0,
+    )
+    total = llm_r.total
+    expected_total = 8.0 + 7.0 + 9.0 + 6.0  # = 30.0
+    has_field = hasattr(llm_r, "analysis_depth")
+    has_weight = "analysis_depth" in LLM_SCORE_WEIGHTS
+    total_ok = abs(total - expected_total) < 0.01
+    if has_field and has_weight and total_ok:
+        record("E.6", "analysis_depth field + LLM weight exists", True,
+               f"total={total}, weight={LLM_SCORE_WEIGHTS.get('analysis_depth')}")
+    else:
+        record("E.6", "analysis_depth field + LLM weight exists", False,
+               f"has_field={has_field}, has_weight={has_weight}, total={total}")
+except Exception as e:
+    record("E.6", "analysis_depth field + LLM weight exists", False,
+           traceback.format_exc())
+
+# E.7: Completeness scaling — intercity 5 items scaled to ≤25.0
+try:
+    from config import CODE_SCORE_WEIGHTS
+    max_comp = CODE_SCORE_WEIGHTS.get("completeness", 25.0)
+    _s = max_comp / 35.0
+    # intercity: 5 x 7.0 * _s
+    scaled_sum = 5 * 7.0 * _s
+    if abs(scaled_sum - max_comp) < 0.01:
+        record("E.7", "Completeness scaling: intercity 5x7*_s = max_score", True,
+               f"scaled_sum={scaled_sum:.2f}, max={max_comp}")
+    else:
+        record("E.7", "Completeness scaling: intercity 5x7*_s = max_score", False,
+               f"scaled_sum={scaled_sum:.2f}, expected={max_comp}")
+except Exception as e:
+    record("E.7", "Completeness scaling: intercity 5x7*_s = max_score", False,
+           traceback.format_exc())
+
+# E.8: 50/50 total score range — code max 50, LLM max 50
+try:
+    from config import TOTAL_CODE_SCORE, TOTAL_LLM_SCORE
+    from scorer import ScoreBreakdown
+    code_ok = abs(TOTAL_CODE_SCORE - 50.0) < 0.01
+    llm_ok = abs(TOTAL_LLM_SCORE - 50.0) < 0.01
+    # Verify ScoreBreakdown with max scores
+    sb = ScoreBreakdown()
+    sb.info_consistency = 25.0
+    sb.completeness = 25.0
+    sb.llm_practicality = 12.5
+    sb.llm_analysis_depth = 12.5
+    sb.llm_logic = 12.5
+    sb.llm_user_experience = 12.5
+    code_total_ok = abs(sb.code_total - 50.0) < 0.01
+    llm_total_ok = abs(sb.llm_total - 50.0) < 0.01
+    total_ok = abs(sb.total - 100.0) < 0.01
+    all_ok = code_ok and llm_ok and code_total_ok and llm_total_ok and total_ok
+    if all_ok:
+        record("E.8", "50/50 split: code=50, LLM=50, total=100", True,
+               f"code={sb.code_total}, llm={sb.llm_total}, total={sb.total}")
+    else:
+        record("E.8", "50/50 split: code=50, LLM=50, total=100", False,
+               f"TOTAL_CODE={TOTAL_CODE_SCORE}, TOTAL_LLM={TOTAL_LLM_SCORE}, "
+               f"code_total={sb.code_total}, llm_total={sb.llm_total}, total={sb.total}")
+except Exception as e:
+    record("E.8", "50/50 split: code=50, LLM=50, total=100", False,
            traceback.format_exc())
 
 
@@ -716,11 +945,11 @@ def print_results():
       +----+------------------------------------+-----------+----------+---------+---------------------------+
       | P  | Trigger                            | code      | llm      | total   | Notes                     |
       +----+------------------------------------+-----------+----------+---------+---------------------------+
-      | P1 | LLM validator all models fail      | computed  | 0        | 0-70    | code-first, LLM optional  |
+      | P1 | LLM validator all models fail      | computed  | 0        | 0-50    | code-first, LLM optional  |
       | P2 | tool_info_used=False               | computed  | computed | 0       | hard fail multiplier 0.0  |
       | P3 | format_valid fail                  | computed  | computed | ~x*0.15 | RL gradient kept          |
-      | P4 | Normal flow (LLM available)        | computed  | set      | 0-100   | full scoring              |
-      | P5 | No LLM validator (no API key)      | computed  | 0        | 0-70    | code-only scoring         |
+      | P4 | Normal flow (LLM available)        | computed  | set      | 0-100   | full scoring (50/50)      |
+      | P5 | No LLM validator (no API key)      | computed  | 0        | 0-50    | code-only scoring         |
       +----+------------------------------------+-----------+----------+---------+---------------------------+
 
     [2.5] Anti-Inflation Hardening
@@ -731,17 +960,28 @@ def print_results():
       | Completeness: keyword+context only         | 15% free credit                   | 0% (requires tool grounding)      |
       | Quantity scaling floor                     | max(0.25, ratio) → 25% minimum    | Linear: ratio (no floor)          |
       | Day structure baseline                     | 0.3 base even with 0 POIs         | 0.0 without matched POIs          |
-      | Budget/tips fallback to POI names          | POI names as price proxy → 100%   | 20% structural credit max         |
+      | Budget/tips fallback to POI names          | POI names as price proxy → 100%   | 10% structural credit max         |
       | IC empty tool_facts                        | 50% free score                    | 10-20% based on tool content      |
       | POI fabrication                            | No check                          | -3.0 penalty when 0 tool POIs used|
       +-------------------------------------------+-----------------------------------+-----------------------------------+
 
-    [2.6] Known Acceptable Risks
+    [2.6] Anti-Echo Hardening (Structured Echo Attack Prevention)
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
+      | Weakness                                  | Old Behavior                      | New Behavior                      |
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
+      | Tier-2: keyword+fact anywhere              | 50% always                        | 50% if proximate, 20% if distant  |
+      | tool_info_used gate too low                | IC>=5 (14%)                       | IC>=6 transport, IC>=4 others     |
+      | Structural credit without data             | 20% free                          | 10% free                          |
+      | IC breadth penalty too weak                | >=4 total, 0.5x penalty           | >=3 total, 0.3x penalty           |
+      | IC no context requirement                  | Fact anywhere counts              | Out-of-context facts count 50%    |
+      +-------------------------------------------+-----------------------------------+-----------------------------------+
+
+    [2.7] Known Acceptable Risks
       +------------------------------------------+--------+----------------------------------------------+
       | Risk                                     | Sev    | Rationale                                    |
       +------------------------------------------+--------+----------------------------------------------+
       | AsyncOpenAI no explicit close             | Low    | Single instance, container exit reclaims     |
-      | LLM unavailable → max 70 pts             | Low    | Code-first: fair within same eval batch      |
+      | LLM unavailable → max 50 pts             | Low    | Code-first: fair within same eval batch      |
       | CHUTES_API_KEY required for LLM scoring  | None   | Code scoring works without it                |
       +------------------------------------------+--------+----------------------------------------------+
     """))

@@ -27,7 +27,7 @@ class LLMValidationResult:
     tool_usage_reason: str = ""
 
     practicality: float = 0.0
-    informativeness: float = 0.0
+    analysis_depth: float = 0.0
     logic: float = 0.0
     user_experience: float = 0.0
 
@@ -39,14 +39,14 @@ class LLMValidationResult:
 
     @property
     def total(self) -> float:
-        return self.practicality + self.informativeness + self.logic + self.user_experience
+        return self.practicality + self.analysis_depth + self.logic + self.user_experience
 
     def to_dict(self) -> dict:
         return {
             "tool_info_used": self.tool_info_used,
             "tool_usage_reason": self.tool_usage_reason,
             "practicality": self.practicality,
-            "informativeness": self.informativeness,
+            "analysis_depth": self.analysis_depth,
             "logic": self.logic,
             "user_experience": self.user_experience,
             "total": self.total,
@@ -59,6 +59,13 @@ class LLMValidationResult:
 # Prompt template (Chinese for Chinese travel planning evaluation)
 LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下旅行规划方案的输出质量。
 注意：工具信息使用已由代码验证，你只需评估规划质量。
+
+=== 重要评分原则 ===
+请特别注意区分两种模型行为：
+1.「数据搬运」：将工具返回的信息原样列出，仅做简单排列，缺乏分析和整合
+2.「深度分析」：基于工具数据进行推理，解释为什么推荐，分析利弊权衡，给出个性化建议
+
+数据搬运行为应在各维度获低分，尤其是分析深度维度。
 
 === 用户需求 ===
 问题类型: {problem_type}
@@ -89,12 +96,12 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 - 5分: 基本可行但有小问题
 - 0分: 明显不可行（如时间冲突、距离不合理）
 
-【维度2: 信息丰富度 informativeness】(0-10分)
-检查提供的信息是否全面有用。
-- 9-10分: 每天都有具名景点(≥2个)+具体餐厅推荐+住宿建议，交通有具体班次号和价格
-- 6-8分: 信息基本完整，但部分天缺乏具体名称或价格
-- 3-5分: 仅有笼统描述，具体信息（名称、价格、时间）不足一半天数
-- 0-2分: 信息稀少，几乎无实用价值
+【维度2: 分析深度 analysis_depth】(0-10分)
+检查是否对工具数据进行了有意义的分析和推理，而非简单搬运。
+- 9-10分: 对推荐内容给出具体理由（如"西湖边餐厅步行5分钟，适合游览后用餐"），有明确的利弊权衡，基于用户约束做了取舍分析
+- 6-8分: 有部分分析，但不够深入，部分推荐缺乏理由
+- 3-5分: 主要是数据罗列，少量分析
+- 0-2分: 纯数据搬运，无分析推理，只是把工具返回的信息重新排列
 
 【维度3: 逻辑连贯性 logic】(0-10分)
 检查规划的逻辑是否清晰连贯。
@@ -116,7 +123,7 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 ```json
 {{
   "practicality": {{"score": <0-10>, "reason": "<说明>"}},
-  "informativeness": {{"score": <0-10>, "reason": "<说明>"}},
+  "analysis_depth": {{"score": <0-10>, "reason": "<说明>"}},
   "logic": {{"score": <0-10>, "reason": "<说明>"}},
   "user_experience": {{"score": <0-10>, "reason": "<说明>"}}
 }}
@@ -387,9 +394,9 @@ class LLMValidator:
             result.practicality = min(10, max(0, score))
             result.reasons["practicality"] = reason
 
-            score, reason = self._extract_dimension_score(data.get("informativeness", 0))
-            result.informativeness = min(10, max(0, score))
-            result.reasons["informativeness"] = reason
+            score, reason = self._extract_dimension_score(data.get("analysis_depth", 0))
+            result.analysis_depth = min(10, max(0, score))
+            result.reasons["analysis_depth"] = reason
 
             score, reason = self._extract_dimension_score(data.get("logic", 0))
             result.logic = min(10, max(0, score))
