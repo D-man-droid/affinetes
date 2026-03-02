@@ -16,7 +16,9 @@ from .env_detector import EnvDetector, EnvType
 
 _REPO_URL_PREFIXES = ("http://", "https://", "git://", "git@")
 _REPO_URL_PATTERN = re.compile(
-    r"^(?:https?://|git://|git@)[\w.@:/~-]+(?:\.git)?(?:#[\w./-]+(?::[\w./-]+)?)?$"
+    r"^(?:https?://|git://|git@)"
+    r"[\w.@:/~-]+(?:\.git)?"
+    r"(?:#[\w./-]+(?::[\w./-]+)?)?$"
 )
 
 
@@ -33,7 +35,9 @@ class ImageBuilder:
     @staticmethod
     def is_repo_url(source: str) -> bool:
         """Return True if *source* looks like a Git repository URL."""
-        return source.startswith(_REPO_URL_PREFIXES) and bool(_REPO_URL_PATTERN.match(source))
+        if not source.startswith(_REPO_URL_PREFIXES):
+            return False
+        return bool(_REPO_URL_PATTERN.match(source))
 
     @staticmethod
     def parse_repo_url(url: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -74,7 +78,8 @@ class ImageBuilder:
             cmd += ["--branch", ref]
         cmd += [clone_url, str(dest)]
 
-        logger.info(f"Cloning {clone_url}" + (f" (ref={ref})" if ref else ""))
+        ref_info = f" (ref={ref})" if ref else ""
+        logger.info(f"Cloning {clone_url}{ref_info}")
         try:
             result = subprocess.run(
                 cmd,
@@ -88,8 +93,9 @@ class ImageBuilder:
                 f"git clone timed out after 300s: {clone_url}"
             )
         if result.returncode != 0:
+            stderr = result.stderr.strip()
             raise ImageBuildError(
-                f"git clone failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"git clone failed (exit {result.returncode}): {stderr}"
             )
 
     def build_from_repo(

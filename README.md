@@ -120,10 +120,16 @@ class Actor:
 Build and run:
 
 ```python
-# Build image
+# Build from local directory
 af_env.build_image_from_env(
     env_path="environments/calculator",
     image_tag="calculator:latest"
+)
+
+# Or build directly from a Git repository URL (no manual clone needed)
+af_env.build_image_from_env(
+    env_path="https://github.com/AffineFoundation/liveweb-arena.git#main",
+    image_tag="liveweb-arena:latest"
 )
 
 # Load and execute
@@ -499,11 +505,11 @@ docker stop calc
 
 ### `build_image_from_env()`
 
-Build Docker image from environment directory.
+Build Docker image from a local environment directory **or** a Git repository URL.
 
 ```python
 af_env.build_image_from_env(
-    env_path: str,                          # Path to environment directory
+    env_path: str,                          # Local path or Git repo URL
     image_tag: str,                         # Image tag (e.g., "affine:latest")
     nocache: bool = False,                  # Don't use build cache
     quiet: bool = False,                    # Suppress build output
@@ -512,13 +518,23 @@ af_env.build_image_from_env(
 ```
 
 **Requirements:**
-- `env_path` must contain `env.py` file
-- Optional: `Dockerfile`, `requirements.txt`, other Python files
+- `env_path` must be a local directory containing `env.py` and `Dockerfile`, **or** a Git repository URL
+- Optional: `requirements.txt`, other Python files
+- When using a URL, `git` must be installed
+
+**URL syntax** (Docker-style fragment):
+```
+https://github.com/org/repo.git                  # default branch, repo root
+https://github.com/org/repo.git#branch           # specific branch/tag
+https://github.com/org/repo.git#branch:path/to   # branch + subfolder
+git@github.com:org/repo.git#v1.0:environments/web  # SSH + tag + subfolder
+```
 
 **Behavior:**
 - Detects environment type (function-based or http-based)
 - For function-based: Builds base image, then injects HTTP server (two-stage build)
 - For http-based: Uses existing Dockerfile as-is
+- For Git URLs: Shallow-clones into a temp directory, builds, then cleans up
 
 ### `load_env()`
 
