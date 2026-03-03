@@ -55,7 +55,10 @@ from affinetes.core.openenv import OpenEnvResponse
 
 # ==================== MCP Server Configuration (QQR Format) ====================
 # Fix epoch salt at import time — stable within a single process lifetime
-_EPOCH_SALT = os.getenv("TRANSPORT_SALT", str(int(time.time()) // (7 * 86400)))
+# Daily rotation + per-process jitter for anti-memorization (P4)
+_DAILY_SALT = str(int(time.time()) // 86400)
+_PROCESS_SALT = uuid.uuid4().hex[:8]
+_EPOCH_SALT = os.getenv("TRANSPORT_SALT", f"{_DAILY_SALT}_{_PROCESS_SALT}")
 
 def mcp_server_config_fn() -> list:
     """
@@ -73,12 +76,12 @@ def mcp_server_config_fn() -> list:
             "PYTHONPATH": PYTHONPATH or "",
         },
     )
-    # AMap cache TTL aligned to TRANSPORT_SALT epoch boundary.
-    # Ensures AMap data stays stable within the same scoring epoch (week).
-    _SECONDS_PER_WEEK = 7 * 86400
+    # AMap cache TTL aligned to daily salt rotation (P4).
+    # Ensures AMap data stays stable within the same scoring day.
+    _SECONDS_PER_DAY = 86400
     _now = int(time.time())
-    _epoch_start = _now // _SECONDS_PER_WEEK * _SECONDS_PER_WEEK
-    _amap_cache_ttl = max(86400, _epoch_start + _SECONDS_PER_WEEK - _now)
+    _epoch_start = _now // _SECONDS_PER_DAY * _SECONDS_PER_DAY
+    _amap_cache_ttl = max(3600, _epoch_start + _SECONDS_PER_DAY - _now)
 
     amap_server = MCPServerStdioCacheable(
         name="AMap",
@@ -174,7 +177,14 @@ class StepRewardCalculator:
             if tool_name in {"search_flights", "search_train_tickets"}:
                 score += 0.2
 
-        return min(1.0, score)
+        # Late-stage diversity penalty: after step 5, if repeating a tool
+        # while required tools remain uncalled, penalize to encourage exploration
+        if step_number > 5 and tool_name in called_tools_so_far:
+            uncalled_required = required - called_tools_so_far - {tool_name}
+            if uncalled_required:
+                score -= 0.15
+
+        return max(0.0, min(1.0, score))
 
     @staticmethod
     def _arg_quality_score(tool_name: str, args: Dict) -> float:
@@ -258,6 +268,7 @@ class EpisodeState:
     done: bool = False
     final_score: float = 0.0
     score_breakdown: Optional[Dict] = None
+    _score_breakdown_full: Optional[Dict] = None  # Internal debug only
 
 
 class Actor:
@@ -476,15 +487,8 @@ class Actor:
                 for r in tool_results
             )
 
-            # Check which required tools haven't been called
-            called_tool_names = set(t["name"] for t in ep.tool_trace)
-            required_tools = set(ep.problem.required_tools)
-            missing_tools = required_tools - called_tool_names
-
-            if missing_tools:
-                hint = f"\n\n**注意**：你还需要调用以下工具获取完整信息：{', '.join(missing_tools)}。请继续调用这些工具，然后再提供最终规划方案。"
-            else:
-                hint = "\n\n所有必需工具已调用完成，请根据以上信息提供详细的规划方案。"
+            # Neutral hint — do not reveal which tools are missing (P6 anti-hack)
+            hint = "\n\n请根据已获取的信息继续。如需更多信息，请调用相关工具；如信息充分，请提供详细的规划方案。"
 
             ep.conversation.append({
                 "role": "user",
@@ -520,7 +524,13 @@ class Actor:
                 score_result = await self._scorer.score(
                     scoring_input, ep.problem, ep.tool_trace
                 )
-                ep.score_breakdown = score_result.to_dict()
+                # QQR_DEBUG=1 → full breakdown for internal eval/debug
+                # Default → safe (obfuscated) breakdown for external/RL consumption
+                if os.getenv("QQR_DEBUG", "0") == "1":
+                    ep.score_breakdown = score_result.to_dict()
+                else:
+                    ep.score_breakdown = score_result.to_safe_dict()
+                ep._score_breakdown_full = score_result.to_dict()
 
                 if score_result.llm_validation_error:
                     # LLM validator unavailable after all retries/fallbacks.
@@ -724,13 +734,7 @@ class Actor:
 
                 score = final_ep.final_score
 
-                # Build result with truncated conversation to reduce memory
-                # Keep only first 2 messages (system + user prompt) and last 2 messages
                 conv = final_ep.conversation
-                if len(conv) > 6:
-                    truncated_conv = conv[:2] + [{"role": "system", "content": f"... {len(conv) - 4} messages omitted ..."}] + conv[-2:]
-                else:
-                    truncated_conv = conv
 
                 result = {
                     "task_name": "qqr",
@@ -738,7 +742,7 @@ class Actor:
                     "success": score >= 60,
                     "time_taken": (datetime.now() - start_time).total_seconds(),
                     "extra": {
-                        "conversation": truncated_conv,
+                        "conversation": conv,
                         "conversation_total_messages": len(conv),
                         "tool_trace": final_ep.tool_trace,
                         "seed": seed,

@@ -16,6 +16,8 @@ Enhanced with knowledge graph for semantic coherence, DifficultyProfile for
 multi-dimensional difficulty control, and seasonal validation.
 """
 
+import hashlib
+import os
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -269,8 +271,10 @@ class ProblemGenerator:
         """
         rng = random.Random(task_id)
 
-        # Determine problem type from task_id
-        problem_type = PROBLEM_TYPES[task_id % len(PROBLEM_TYPES)]
+        # P4: Hash-based problem type — unpredictable, prevents task_id % 7 memorization
+        _epoch_salt = os.getenv("TRANSPORT_SALT", "default")
+        _type_hash = hashlib.sha256(f"{task_id}_{_epoch_salt}_type".encode()).hexdigest()
+        problem_type = PROBLEM_TYPES[int(_type_hash[:8], 16) % len(PROBLEM_TYPES)]
 
         # Determine difficulty if not overridden
         if difficulty is None:

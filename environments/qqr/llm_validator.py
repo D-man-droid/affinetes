@@ -56,9 +56,16 @@ class LLMValidationResult:
         }
 
 
-# Prompt template (Chinese for Chinese travel planning evaluation)
+# Parameterized prompt template (P2: anti-memorization through randomization)
+# Penalty values and dimension order are filled dynamically per task+epoch
 LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下旅行规划方案的输出质量。
 注意：工具信息使用已由代码验证，你只需评估规划质量。
+
+=== 评分校准 ===
+请注意：5分代表"中等水平"，不是"差"。大多数普通规划应得5-6分。
+7-8分应保留给明显高于平均水平的维度。9-10分极为罕见。
+如果你觉得四个维度平均分超过7分，请重新检查是否对标准要求够严格。
+{calibration_anchor}
 
 === 重要评分原则 ===
 请特别注意区分两种模型行为：
@@ -68,7 +75,6 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 数据搬运行为应在各维度获低分，尤其是分析深度维度。
 
 === 用户需求 ===
-问题类型: {problem_type}
 出发城市: {origin_city}
 目的地: {destination_city}
 旅行日期: {travel_date}
@@ -90,31 +96,7 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
 
 请评估以下四个维度的输出质量。
 
-【维度1: 规划可行性 practicality】(0-10分)
-检查规划是否切实可行。
-- 10分: 时间安排合理，交通衔接顺畅，无明显冲突
-- 5分: 基本可行但有小问题
-- 0分: 明显不可行（如时间冲突、距离不合理）
-
-【维度2: 分析深度 analysis_depth】(0-10分)
-检查是否对工具数据进行了有意义的分析和推理，而非简单搬运。
-- 9-10分: 对推荐内容给出具体理由（如"西湖边餐厅步行5分钟，适合游览后用餐"），有明确的利弊权衡，基于用户约束做了取舍分析
-- 6-8分: 有部分分析，但不够深入，部分推荐缺乏理由
-- 3-5分: 主要是数据罗列，少量分析
-- 0-2分: 纯数据搬运，无分析推理，只是把工具返回的信息重新排列
-
-【维度3: 逻辑连贯性 logic】(0-10分)
-检查规划的逻辑是否清晰连贯。
-- 10分: 行程安排有逻辑，路线规划合理，前后呼应
-- 5分: 基本合理但有小跳跃
-- 0分: 逻辑混乱，安排杂乱无章
-
-【维度4: 用户体验 user_experience】(0-10分)
-检查规划是否考虑用户需求和体验。
-- 9-10分: 明确回应所有用户约束和偏好，预算分配合理，矛盾约束有明确权衡说明
-- 6-8分: 回应了大部分需求，但部分约束或偏好未体现
-- 3-5分: 仅部分考虑，多数约束被忽略，预算分配不合理
-- 0-2分: 完全忽视用户需求，通用模板
+{dimension_blocks}
 
 === 输出格式 ===
 
@@ -128,6 +110,43 @@ LLM_VALIDATOR_PROMPT = '''你是旅游规划质量评估专家。请评估以下
   "user_experience": {{"score": <0-10>, "reason": "<说明>"}}
 }}
 ```'''
+
+
+# Dimension block templates with parameterized penalties
+_DIM_BLOCKS = {
+    "practicality": '''【{dim_label}: 规划可行性 practicality】(0-10分)
+评分方法：从8分起评，按以下问题扣分（最低0分）：
+- 未说明景点间交通方式或耗时 → -{penalty_transport}分
+- 未给出每日具体时间段（如"上午9点""下午2点"） → -{penalty_time}分
+- 出现时间冲突（同时段安排两个活动）→ -{penalty_conflict}分
+- 跨城行程未安排城际交通 → -{penalty_cross_city}分
+
+加分项（最高10分）：
+- 每段交通都有具体方式+耗时 → +1分
+- 时间安排精确到小时且无冲突 → +1分''',
+    "analysis_depth": '''【{dim_label}: 分析深度 analysis_depth】(0-10分)
+- 9-10分: 每个推荐都有具体数据支撑的理由，有明确利弊对比，基于约束做了取舍分析
+- 7-8分: 多数推荐有理由，部分分析较浅
+- 5-6分: 约一半推荐有分析，另一半是简单罗列
+- 3-4分: 主要是数据罗列，分析浮于表面
+- 0-2分: 纯数据搬运，零分析''',
+    "logic": '''【{dim_label}: 逻辑连贯性 logic】(0-10分)
+评分方法：从8分起评，按以下问题扣分（最低0分）：
+- 相邻景点不在同一区域（不必要的跨区移动）→ -{penalty_cross_district}分
+- 出现不必要的折返 → -{penalty_backtracking}分
+- 景点安排无说明顺序理由 → -{penalty_no_reason}分
+- 地理方位完全不合理 → -{penalty_geography}分
+
+加分项（最高10分）：
+- 明确说明按地理位置/区域分组安排 → +1分
+- 路线形成合理的单向或环形 → +1分''',
+    "user_experience": '''【{dim_label}: 用户体验 user_experience】(0-10分)
+- 9-10分: 所有约束和偏好明确回应，预算分配合理且有说明，矛盾约束有权衡
+- 7-8分: 大部分需求已回应，1-2个约束未体现
+- 5-6分: 回应了核心需求，但多个约束被忽略
+- 3-4分: 仅部分考虑，通用模板感明显
+- 0-2分: 完全忽视用户需求''',
+}
 
 
 class LLMValidator:
@@ -160,7 +179,7 @@ class LLMValidator:
         problem: TravelProblem,
         tool_trace: List[Dict],
     ) -> LLMValidationResult:
-        """Execute LLM validation with fallback models."""
+        """Execute LLM validation with fallback models + cross-validation (P2)."""
         if not tool_trace:
             return LLMValidationResult(
                 tool_info_used=False,
@@ -172,20 +191,58 @@ class LLMValidator:
 
         # Try primary, then fallbacks — all on same Chutes client
         models = [self.model] + self.FALLBACK_MODELS
+        primary_result = None
+        primary_model = None
         for model_name in models:
             retries = 2 if model_name == self.model else 1
             result = await self._try_validate_with_retries(
                 self.client, model_name, prompt, retries=retries
             )
             if result.success:
-                return result
+                primary_result = result
+                primary_model = model_name
+                break
             print(f"[LLM_VALIDATOR] {model_name} failed: {result.error}")
 
-        # All models failed for this evaluation
-        return LLMValidationResult(
-            success=False,
-            error=f"All {len(models)} models failed",
+        if primary_result is None:
+            return LLMValidationResult(
+                success=False,
+                error=f"All {len(models)} models failed",
+            )
+
+        # P2: Cross-validation for high-scoring outputs
+        primary_result = await self._cross_validate(
+            prompt, primary_result, primary_model
         )
+        return primary_result
+
+    async def _cross_validate(
+        self, prompt: str, primary_result: LLMValidationResult, primary_model: str
+    ) -> LLMValidationResult:
+        """When primary LLM gives high scores, get a second opinion (P2)."""
+        if primary_result.total <= 28:  # <=70% of 40 max → skip
+            return primary_result
+
+        # Use a different model for cross-validation
+        cross_models = [m for m in self.FALLBACK_MODELS if m != primary_model]
+        if not cross_models:
+            return primary_result
+
+        cross_model = cross_models[0]
+        cross_result = await self._try_validate_with_retries(
+            self.client, cross_model, prompt, retries=1
+        )
+
+        if not cross_result.success:
+            return primary_result  # Fallback: trust primary
+
+        # Take minimum of each dimension (conservative)
+        for dim in ["practicality", "analysis_depth", "logic", "user_experience"]:
+            primary_val = getattr(primary_result, dim)
+            cross_val = getattr(cross_result, dim)
+            setattr(primary_result, dim, min(primary_val, cross_val))
+
+        return primary_result
 
     async def _try_validate_with_retries(
         self,
@@ -236,13 +293,50 @@ class LLMValidator:
         problem: TravelProblem,
         tool_trace: List[Dict],
     ) -> str:
-        """Build evaluation prompt with sanitized model output."""
+        """Build evaluation prompt with parameterized rubric (P2 anti-memorization)."""
+        from config import LLM_RUBRIC_PENALTY_RANGES
+        import random as _rand
+        import os
+
         tool_trace_formatted = self._format_tool_trace(tool_trace)
         sanitized_output = self._sanitize_output_for_validation(model_output)
         boundary_token = uuid.uuid4().hex[:12]
 
+        # Parameterized rubric: randomize penalties per task+epoch
+        epoch_salt = os.getenv("TRANSPORT_SALT", "default")
+        rng = _rand.Random(f"{problem.task_id}_{epoch_salt}_rubric")
+        penalties = {k: rng.randint(*v) for k, v in LLM_RUBRIC_PENALTY_RANGES.items()}
+
+        # Randomize dimension order (4! = 24 permutations)
+        dim_order = ["practicality", "analysis_depth", "logic", "user_experience"]
+        rng.shuffle(dim_order)
+
+        # Build dimension blocks with parameterized penalties
+        dim_labels = {d: f"维度{i+1}" for i, d in enumerate(dim_order)}
+        dim_blocks_parts = []
+        for dim in dim_order:
+            block = _DIM_BLOCKS[dim].format(
+                dim_label=dim_labels[dim],
+                penalty_transport=penalties.get("no_transport_mode", 3),
+                penalty_time=penalties.get("no_time_slots", 2),
+                penalty_conflict=penalties.get("time_conflict", 4),
+                penalty_cross_city=penalties.get("cross_city_no_transport", 4),
+                penalty_cross_district=penalties.get("cross_district", 3),
+                penalty_backtracking=penalties.get("backtracking", 2),
+                penalty_no_reason=penalties.get("no_order_reason", 2),
+                penalty_geography=penalties.get("bad_geography", 4),
+            )
+            dim_blocks_parts.append(block)
+
+        # Calibration anchor: random calibration sentence
+        anchors = [
+            "注意：此类旅行规划通常得4-6分，高于7分需有充分理由。",
+            "参考：一般水平的规划在各维度约5分左右。",
+            "校准提示：请确保评分分布合理，避免集中在高分段。",
+        ]
+        calibration_anchor = rng.choice(anchors)
+
         return LLM_VALIDATOR_PROMPT.format(
-            problem_type=problem.problem_type,
             origin_city=problem.origin_city or "N/A",
             destination_city=problem.destination_city,
             travel_date=problem.travel_date,
@@ -254,35 +348,49 @@ class LLMValidator:
             tool_trace_formatted=tool_trace_formatted,
             model_output=sanitized_output,
             boundary_token=boundary_token,
+            dimension_blocks="\n\n".join(dim_blocks_parts),
+            calibration_anchor=calibration_anchor,
         )
 
     def _sanitize_output_for_validation(self, raw_output: str) -> str:
-        """Extract factual content from model output, filtering instruction-like text.
+        """Extract factual content from model output, filtering injection attempts.
 
-        Removes prompt injection attempts by stripping lines that look like
-        scoring instructions or system directives.
+        P2 hardened: whitelist-first approach + expanded blacklist.
+        1. Remove all control characters and invisible Unicode
+        2. Remove Unicode directional overrides (can hide injections)
+        3. Apply expanded injection pattern blacklist (15+ patterns)
         """
-        # Truncate to reasonable length
         text = raw_output[:15000]
 
-        # Remove lines that look like prompt injection attempts
+        # Layer 1: Remove control characters and invisible Unicode
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        # Remove Unicode directional/invisible characters
+        text = re.sub(r'[\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff]', '', text)
+
+        # Layer 2: Expanded injection pattern blacklist
         injection_patterns = [
+            # Original 6 patterns
             r'(?i)(?:请|please)?\s*(?:忽略|ignore)\s*(?:以上|above|previous)',
             r'(?i)(?:将|set)\s*(?:所有|all)\s*(?:分数|score)',
             r'(?i)(?:你是|you are)\s*(?:一个|a)\s*(?:评分|scoring)',
             r'(?i)(?:system|系统)\s*(?:prompt|提示)',
             r'(?i)(?:override|覆盖)\s*(?:instructions?|指令)',
             r'(?i)给\s*(?:满分|最高分|10分)',
+            # New patterns (P2)
+            r'(?i)(?:评分|score)\s*(?:标准|rubric|criteria)',
+            r'(?i)(?:json|JSON)\s*(?:格式|format)\s*(?:如下|below)',
+            r'(?i)\{["\']?(?:practicality|logic|analysis_depth|user_experience)',
+            r'(?i)(?:reason|理由)\s*[:：]\s*["\']',
+            r'(?i)(?:assistant|AI|人工智能)\s*(?:注意|note|notice)',
+            r'(?i)(?:以下|following)\s*(?:是|is)\s*(?:评估|evaluation)',
+            r'(?i)(?:根据|according)\s*(?:评分|scoring)\s*(?:标准|standard)',
+            r'(?i)(?:维度|dimension)\s*\d',
+            r'(?i)(?:扣分|deduct|penalty)',
         ]
 
         lines = text.split('\n')
-        filtered_lines = []
-        for line in lines:
-            is_injection = any(re.search(p, line) for p in injection_patterns)
-            if not is_injection:
-                filtered_lines.append(line)
-
-        return '\n'.join(filtered_lines)
+        filtered = [l for l in lines if not any(re.search(p, l) for p in injection_patterns)]
+        return '\n'.join(filtered)
 
     def _get_result_text(self, result) -> str:
         """Extract text from tool result, handling double-nested JSON."""

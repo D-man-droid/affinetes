@@ -95,17 +95,16 @@ PROBLEM_TYPES = [
 ]
 
 # Tool coverage threshold by problem type
-# Non-transport types use 0.5 (half of required tools must be called)
-# because direction/around_search require coordinates that models often
-# cannot extract from text-format tool results (Chutes API workaround)
+# All types use 0.6 — requires 60%+ of required tools (e.g., 3/4 for food_tour)
+# 0.5 was too lenient: allowed 2/4 tools to pass, enabling tool-skipping exploits
 REQUIRED_TOOLS_THRESHOLD = {
     "intercity": 0.6,
-    "multiday": 0.5,
-    "hybrid": 0.5,
-    "single_poi": 0.5,
-    "food_tour": 0.5,
+    "multiday": 0.6,
+    "hybrid": 0.6,
+    "single_poi": 0.6,
+    "food_tour": 0.6,
     "business": 0.6,
-    "family_study": 0.5,
+    "family_study": 0.6,
 }
 
 # Core tools that must all be called
@@ -120,6 +119,22 @@ CORE_TOOLS_BY_TYPE = {
     "business": {"poi_search"},
     "family_study": {"poi_search"},
 }
+
+# Tool diversity tiers by problem type — penalize skipping important tools
+# must_call: always needed, should_call: penalty if skipped, nice_to_have: bonus if called
+TOOL_TIERS_BY_TYPE = {
+    "food_tour":    {"must_call": {"poi_search", "weather"}, "should_call": {"direction"},       "nice_to_have": {"around_search"}},
+    "multiday":     {"must_call": {"poi_search", "weather"}, "should_call": {"direction"},       "nice_to_have": {"around_search"}},
+    "single_poi":   {"must_call": {"poi_search", "weather"}, "should_call": {"around_search"},   "nice_to_have": {"direction"}},
+    "family_study": {"must_call": {"poi_search", "weather"}, "should_call": {"direction"},       "nice_to_have": {"around_search"}},
+    "intercity":    {"must_call": {"poi_search"},            "should_call": set(),                "nice_to_have": {"direction"}},
+    "hybrid":       {"must_call": {"poi_search"},            "should_call": {"direction"},        "nice_to_have": {"around_search"}},
+    "business":     {"must_call": {"poi_search"},            "should_call": set(),                "nice_to_have": {"direction"}},
+}
+DIVERSITY_SHOULD_CALL_PENALTY = 0.25    # Per missing should_call tool
+DIVERSITY_NICE_TO_HAVE_BONUS = 0.05     # Per successful nice_to_have tool
+DIVERSITY_FLOOR = 0.3                   # Minimum diversity multiplier
+DIVERSITY_ATTEMPTED_RECOVERY = 0.15     # Recovery for attempted but failed tools
 
 # Transport tools - at least one must be called for transport-related problems
 TRANSPORT_TOOLS = {"search_flights", "search_train_tickets"}
@@ -143,10 +158,29 @@ INFO_CONSISTENCY_MIN_RATIO = 0.4  # Must use at least 40% of available tool info
 
 # IC minimum quantity gate: when tool returns many facts per category,
 # require a proportional number of matches (not just 1)
-IC_MIN_QUANTITY_THRESHOLD = 4   # Only apply when tool has >= 4 facts in category
-IC_MIN_QUANTITY_RATIO = 0.3     # Require matching at least 30% of tool facts
+IC_MIN_QUANTITY_THRESHOLD = 5   # Only apply when tool has >= 5 facts in category
+IC_MIN_QUANTITY_RATIO = 0.2     # Require matching at least 20% of tool facts
 IC_MIN_QUANTITY_CAP = 3         # Never require more than 3 matches per category
-IC_BELOW_MINIMUM_SCALE = 0.5   # Cap category score at 50% when below minimum
+IC_BELOW_MINIMUM_SCALE = 0.65  # Cap category score at 65% when below minimum
+
+# IC bonus categories: direction-derived, only count in IC total when matched > 0
+# Data: distances 100% zero-score, times 100% zero-score, road_names 75% zero-score
+IC_BONUS_CATEGORIES = {"distances", "road_names", "travel_durations", "times"}
+
+# POI IC denominator cap: prevent AMap's full POI list from inflating denominator
+# Data: tool_count avg=93, matched avg=15, cap=30 → 15/30/0.5 = 1.0 (appropriate)
+IC_POI_DENOMINATOR_CAP = 30
+
+# P5: POI density penalty — penalize excessive POI enumeration
+IC_POI_DENSITY_THRESHOLD = 20  # Start penalizing above this count
+IC_POI_DENSITY_DECAY = 0.02    # Per excess POI, score *= (1 - decay)
+
+# P5: Single category max contribution share
+IC_CATEGORY_MAX_SHARE = 0.35  # Any single IC category contributes at most 35% of total IC
+
+# P3: Template detection parameters
+FACT_INTEGRATION_MIN_REASONING = 3  # At least 3 reasoning connectors near tool facts
+FACT_INTEGRATION_PENALTY = 0.6      # Lack of reasoning → 0.6x completeness
 
 # Format validation thresholds
 FORMAT_MIN_LENGTH = 200         # Minimum output length (chars) for valid format
@@ -163,8 +197,8 @@ IC_OUT_OF_CONTEXT_WEIGHT = 0.5    # Weight for facts not near relevant context k
 # Production data: genuine tool use → IC≈25, Comp≈29; fabricated → IC≈0, Comp≈0
 CODE_TOOL_USED_IC_THRESHOLD = 6.0           # Transport types (intercity, hybrid, business)
 CODE_TOOL_USED_COMP_THRESHOLD = 6.0         # Transport types
-CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT = 4.0   # Non-transport (fewer verifiable categories)
-CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT = 4.0
+CODE_TOOL_USED_IC_THRESHOLD_NONTRANSPORT = 8.0   # Non-transport (raised from 5.0 to close exploit gap)
+CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT = 8.0
 
 # Anti-memorization: require specific POI names from tools
 ENABLE_POI_VERIFICATION = True
@@ -204,12 +238,12 @@ CODE_SCORE_WEIGHTS = {
 
 # Info consistency threshold: ratio/divisor normalization per category
 # 0.5 means 50%+ overlap per category = full score (was 0.3)
-INFO_CONSISTENCY_RATIO_DIVISOR = 0.6
+INFO_CONSISTENCY_RATIO_DIVISOR = 0.5
 
 # Minimum category breadth: if fewer than this many categories matched
 # AND total categories >= MIN_BREADTH_TOTAL, apply breadth penalty
-INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 3
-IC_BREADTH_PENALTY_MULTIPLIER = 0.3  # Harsh penalty for narrow category coverage
+INFO_CONSISTENCY_MIN_BREADTH_TOTAL = 4
+IC_BREADTH_PENALTY_MULTIPLIER = 0.5  # Penalty for narrow category coverage
 
 # Fabrication penalty (deducted from code score, 25% of code max)
 FABRICATION_PENALTY_MAX = -12.5
@@ -227,7 +261,20 @@ HARD_CONSTRAINT_PENALTIES = {
 
 # LLM-code smooth coupling factor
 # llm_score *= min(1.0, code_total / (TOTAL_CODE_SCORE * factor))
-LLM_CODE_RATIO_FACTOR = 0.75
+LLM_CODE_RATIO_FACTOR = 0.6
+
+# P2: Parameterized LLM rubric penalty ranges (anti-memorization)
+# Each penalty is randomized per task+epoch to prevent rubric memorization
+LLM_RUBRIC_PENALTY_RANGES = {
+    "no_transport_mode": (2, 4),
+    "no_time_slots": (1, 3),
+    "time_conflict": (3, 5),
+    "cross_city_no_transport": (3, 5),
+    "cross_district": (2, 4),
+    "backtracking": (1, 3),
+    "no_order_reason": (1, 3),
+    "bad_geography": (3, 5),
+}
 
 # LLM score weights (max 50) - elevated to 50/50 split for anti-hack
 # "analysis_depth" replaces "informativeness" to penalize data-dumping

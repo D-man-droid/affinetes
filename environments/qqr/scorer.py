@@ -6,14 +6,15 @@ Score structure (max 100, 50/50 code-LLM split):
   - Hard fail (score=0): format_valid, tool_info_used
   - Soft penalty (multiplier): required_tools_called(0.5x), poi_names_verified(0.7x),
     transport_grounded(0.3x graduated), tool_quality(0.5x)
-- Code score (50): info_consistency(25), completeness(25)
+- Code score (50): geometric_mean(info_consistency(25), completeness(25))
+  - IC × Comp geometric mean: penalizes imbalanced hack (e.g., high IC low Comp)
   - Code verifies "data presence" — fact matching, overlap ratios
   - tool_quality soft HC gates on coverage/validity ratios
 - Fabrication penalty: 0 to -12.5 (deducted from code score)
 - LLM score (50): practicality(12.5), logic(12.5), user_experience(12.5), analysis_depth(12.5)
   - LLM evaluates "reasoning quality" — logic, feasibility, depth of analysis
   - analysis_depth specifically penalizes data-dumping (copying tool data without reasoning)
-  - Smooth LLM-code coupling: llm *= min(1.0, code / (max_code * 0.75))
+  - Smooth LLM-code coupling: llm *= min(1.0, code / (max_code * 0.6))
   - Replaces cliff-edge cap for better RL gradient
 
 Anti-hack measures:
@@ -25,13 +26,14 @@ Anti-hack measures:
    - Quantity scaling: tier_score *= grounded_facts / target_count (linear, no floor)
    - Budget/tips without price data: max 10% structural credit (anti-echo)
    - Day structure requires matched POIs (no baseline credit)
-2. Info consistency: 60% overlap per category + minimum quantity gate per category
+2. Info consistency: 50% overlap per category + minimum quantity gate per category
    - Flights/trains: context-sensitive matching (out-of-context facts count 50%)
-3. Category breadth: <min_breadth categories AND >=3 available → 0.3x penalty
+3. Category breadth: <min_breadth categories AND >=4 available → 0.5x penalty
 4. Transport grounding: graduated penalty (0.3x at 100% fabrication)
 5. Epoch salt: weekly rotation of transport data prevents memorization
 6. Tool quality gate: <50% coverage OR validity → 0.5x score multiplier
-7. tool_info_used gate: IC≥6 AND Comp≥6 for transport, IC≥4 AND Comp≥4 for others
+7. tool_info_used gate: IC≥6 AND Comp≥6 for transport, IC≥2.5 AND Comp≥2.5 for others
+   - Non-transport tool_info_used fail: 0.1x softened (not 0.0 hard kill)
 """
 
 import re
@@ -69,7 +71,21 @@ from config import (
     STRUCTURAL_CREDIT_RATIO,
     IC_OUT_OF_CONTEXT_WEIGHT,
     IC_BREADTH_PENALTY_MULTIPLIER,
+    IC_BONUS_CATEGORIES,
+    IC_POI_DENOMINATOR_CAP,
+    FACT_INTEGRATION_MIN_REASONING,
+    FACT_INTEGRATION_PENALTY,
+    IC_POI_DENSITY_THRESHOLD,
+    IC_POI_DENSITY_DECAY,
+    IC_CATEGORY_MAX_SHARE,
+    TOOL_TIERS_BY_TYPE,
+    DIVERSITY_SHOULD_CALL_PENALTY,
+    DIVERSITY_NICE_TO_HAVE_BONUS,
+    DIVERSITY_FLOOR,
+    DIVERSITY_ATTEMPTED_RECOVERY,
 )
+import math
+from collections import Counter
 from parser import ParsedOutput, get_parser
 from problem_generator import TravelProblem
 
@@ -126,6 +142,7 @@ class ScoreBreakdown:
     info_consistency: float = 0.0
     completeness: float = 0.0
     fabrication_penalty: float = 0.0
+    tool_diversity_multiplier: float = 1.0
 
     # LLM score (max 50) - smooth coupling with code score
     llm_practicality: float = 0.0
@@ -147,17 +164,32 @@ class ScoreBreakdown:
     # Cross-validation override diagnostic
     tool_info_override: str = ""  # "code_overrode_llm_true" / "code_overrode_llm_false" / ""
 
+    # Diagnostic fields
+    problem_type: str = ""
+    ic_categories: Dict[str, Dict] = field(default_factory=dict)
+    comp_subscores: Dict[str, float] = field(default_factory=dict)
+
     @property
     def total(self) -> float:
         code = max(0.0, self.code_total)
         llm = self.llm_total
 
-        # Smooth LLM-code coupling (replaces cliff-edge cap)
-        # code_ratio scales from 0 to 1 as code approaches 60% of max
+        # P7: Bidirectional coupling
+        # 1. LLM modulated by code (existing)
         code_ratio = min(1.0, code / max(1.0, TOTAL_CODE_SCORE * LLM_CODE_RATIO_FACTOR))
         llm = llm * code_ratio
 
+        # 2. Code modulated by LLM (P7: prevent code-high but LLM-zero anomaly)
+        if self.llm_validation_success:
+            llm_ratio = min(1.0, self.llm_total / (50.0 * 0.4))  # 40% LLM threshold
+            code = code * (0.7 + 0.3 * llm_ratio)  # Minimum 70% code preserved
+
         base = code + llm
+
+        # P7: Monotonicity guard — coupling can't reduce below 50% of raw sum
+        raw_base = max(0.0, self.code_total) + self.llm_total
+        if base < raw_base * 0.5:
+            base = raw_base * 0.5
 
         # Apply hard constraint penalties:
         # - Hard fails (format_valid, tool_info_used) → multiplier 0.0 → total = 0
@@ -170,14 +202,20 @@ class ScoreBreakdown:
                     if name == "transport_grounded" and self.transport_grounding_details:
                         # Graduated transport penalty based on fabrication_ratio
                         fab_ratio = self.transport_grounding_details.get("fabrication_ratio", 1.0)
-                        # 0% fab → 1.0x, 20% → pass (unchanged), 50% → ~0.65x, 100% → 0.3x
                         pen = HARD_CONSTRAINT_PENALTIES.get(name, 0.3)
-                        # Linear interpolation: 1.0 at fab=0.2 down to pen at fab=1.0
                         if fab_ratio <= 0.2:
                             grad_pen = 1.0
                         else:
                             grad_pen = 1.0 - (1.0 - pen) * (fab_ratio - 0.2) / 0.8
                         multiplier *= max(pen, grad_pen)
+                    elif name == "tool_info_used":
+                        # P7: Non-transport types: tightened to 0.05x (was 0.1x)
+                        non_transport_types = {"food_tour", "single_poi", "multiday", "family_study"}
+                        if self.problem_type in non_transport_types:
+                            multiplier *= 0.05
+                        else:
+                            pen = HARD_CONSTRAINT_PENALTIES.get(name, 0.0)
+                            multiplier *= pen
                     else:
                         pen = HARD_CONSTRAINT_PENALTIES.get(name, 0.0)
                         multiplier *= pen
@@ -187,9 +225,16 @@ class ScoreBreakdown:
 
     @property
     def code_total(self) -> float:
-        # code_total only counts info_consistency + completeness (the grounding dimensions)
-        # tool_coverage/validity are kept as diagnostic fields but don't contribute to score
-        base_score = self.info_consistency + self.completeness
+        # Geometric mean of IC × Comp: penalizes imbalanced hack patterns
+        # (e.g., high IC from POI listing but low Comp, or high Comp from templates but low IC)
+        # When IC ≈ Comp, geometric ≈ additive — no impact on balanced real models
+        ic = max(0.0, self.info_consistency)
+        comp = max(0.0, self.completeness)
+        ic_norm = ic / 25.0   # 0 to 1
+        comp_norm = comp / 25.0  # 0 to 1
+        base_score = 50.0 * math.sqrt(ic_norm * comp_norm)
+        # Apply tool diversity multiplier before fabrication penalty
+        base_score *= self.tool_diversity_multiplier
         return round(max(0.0, base_score + self.fabrication_penalty), 2)
 
     @property
@@ -201,15 +246,25 @@ class ScoreBreakdown:
             self.llm_user_experience, 2
         )
 
+    def _coupled_llm_total(self) -> float:
+        """Compute LLM total after code coupling."""
+        code = max(0.0, self.code_total)
+        code_ratio = min(1.0, code / max(1.0, TOTAL_CODE_SCORE * LLM_CODE_RATIO_FACTOR))
+        return round(self.llm_total * code_ratio, 2)
+
     def to_dict(self) -> dict:
         return {
             "total": self.total,
+            "problem_type": self.problem_type,
             "hard_constraints": self.hard_constraints,
             "code_score": {
                 "info_consistency": self.info_consistency,
                 "completeness": self.completeness,
                 "fabrication_penalty": self.fabrication_penalty,
+                "tool_diversity_multiplier": self.tool_diversity_multiplier,
                 "subtotal": self.code_total,
+                "ic_categories": self.ic_categories,
+                "comp_subscores": self.comp_subscores,
             },
             "llm_score": {
                 "practicality": self.llm_practicality,
@@ -217,6 +272,7 @@ class ScoreBreakdown:
                 "logic": self.llm_logic,
                 "user_experience": self.llm_user_experience,
                 "subtotal": self.llm_total,
+                "coupled_subtotal": self._coupled_llm_total(),
                 "reasons": self.llm_reasons,
                 "tool_usage_reason": self.llm_tool_usage_reason,
             },
@@ -227,6 +283,41 @@ class ScoreBreakdown:
             "llm_available": self.llm_validation_success,
             "transport_grounding": self.transport_grounding_details,
             "tool_info_override": self.tool_info_override,
+        }
+
+    def to_safe_dict(self) -> dict:
+        """Return obfuscated breakdown for external consumption.
+
+        Bucketed feedback: scores mapped to 5-level bands.
+        Noise injection: +/- sigma=2.0 Gaussian noise per sub-dimension.
+        No IC category details, no comp subscores, no exact LLM dimension scores.
+        """
+        import random as _r
+
+        def _bucket(score, max_val):
+            ratio = score / max(max_val, 1e-6)
+            if ratio < 0.1:
+                return "very_low"
+            elif ratio < 0.35:
+                return "low"
+            elif ratio < 0.6:
+                return "medium"
+            elif ratio < 0.85:
+                return "high"
+            else:
+                return "very_high"
+
+        def _noisy(score, sigma=2.0):
+            return round(max(0.0, score + _r.gauss(0, sigma)), 2)
+
+        return {
+            "total": self.total,  # exact total still needed for reward signal
+            "code_band": _bucket(max(0.0, self.code_total), TOTAL_CODE_SCORE),
+            "llm_band": _bucket(self._coupled_llm_total(), 50.0),
+            "hard_constraints": {k: v for k, v in self.hard_constraints.items()},
+            "noisy_code": _noisy(max(0.0, self.code_total)),
+            "noisy_llm": _noisy(self._coupled_llm_total()),
+            "llm_available": self.llm_validation_success,
         }
 
 
@@ -738,6 +829,56 @@ class TransportGroundingVerifier:
                     f"{transport_id}: {output_time}"
                 )
 
+    @staticmethod
+    def verify_local_transport_claims(
+        output_text: str,
+        tool_facts: 'ExtractedFacts',
+        called_tools: Set[str],
+        problem_type: str
+    ) -> float:
+        """Detect fabricated local transport claims in non-transport problem types.
+
+        Only applies when:
+        1. Problem type is NOT in REQUIRES_TRANSPORT (e.g., food_tour, multiday)
+        2. 'direction' tool was never called
+
+        Scans output for specific distance/time claims that imply route knowledge
+        the model couldn't have (no direction tool was called).
+
+        Returns multiplier [0.5, 1.0]:
+        - 1.0 = no fabrication detected
+        - 0.5 = heavy fabrication (>=5 ungrounded claims)
+        """
+        # Only check non-transport types where direction was not called
+        if problem_type in REQUIRES_TRANSPORT:
+            return 1.0
+        if "direction" in called_tools:
+            return 1.0
+
+        # Patterns for specific distance/time claims (not vague "附近")
+        distance_claim_pattern = re.compile(
+            r'(?:距离|相距|路程|全程)[约大概]*\s*(\d+(?:\.\d+)?)\s*(公里|km|千米|米)',
+            re.IGNORECASE
+        )
+        time_claim_pattern = re.compile(
+            r'(?:打车|驾车|开车|乘车|坐车|步行|骑行|公交|地铁|出租车)[约大概]*\s*(\d+)\s*(分钟|小时|min)',
+            re.IGNORECASE
+        )
+
+        # Count ungrounded claims
+        distance_claims = distance_claim_pattern.findall(output_text)
+        time_claims = time_claim_pattern.findall(output_text)
+        total_claims = len(distance_claims) + len(time_claims)
+
+        if total_claims == 0:
+            return 1.0
+        elif total_claims >= 5:
+            return 0.5
+        elif total_claims >= 3:
+            return 0.65
+        else:
+            return 0.8
+
 
 # ============================================================================
 # Claim Verifier - Verify output claims against tool facts
@@ -1017,6 +1158,7 @@ class TravelScorer:
         tool_trace: Optional[List[Dict]] = None,
     ) -> ScoreBreakdown:
         result = ScoreBreakdown()
+        result.problem_type = problem.problem_type
         tool_trace = tool_trace or []
 
         parsed = self._parser.parse(raw_output)
@@ -1036,10 +1178,33 @@ class TravelScorer:
             coverage_ratio >= 0.5 and validity_ratio >= 0.5
         )
 
-        result.info_consistency = self._score_info_consistency(
-            parsed, tool_trace, tool_facts, output_facts
+        # Fix 1: Tool diversity multiplier
+        result.tool_diversity_multiplier = self._compute_tool_diversity_multiplier(
+            tool_trace, problem
         )
-        result.completeness = self._score_completeness(parsed, problem, tool_facts)
+
+        result.info_consistency = self._score_info_consistency(
+            parsed, tool_trace, tool_facts, output_facts, result=result,
+            problem=problem
+        )
+
+        # P4: POI freshness penalty — penalize outputs using memorized POIs
+        poi_freshness = self._check_poi_freshness(output_facts, tool_facts)
+        if poi_freshness < 0.3 and tool_facts.pois:
+            # 70%+ of output POIs are from memory, not tools
+            result.info_consistency *= 0.5
+
+        result.completeness = self._score_completeness(
+            parsed, problem, tool_facts, result=result
+        )
+
+        # Fix 2: Non-transport fabrication detection — penalize fabricated distance/time claims
+        local_fab = TransportGroundingVerifier.verify_local_transport_claims(
+            raw_output, tool_facts, called_tools, problem.problem_type
+        )
+        if local_fab < 1.0:
+            result.completeness *= local_fab
+            result.info_consistency *= local_fab
 
         # 2. Code-determined tool_info_used (epoch-salted fact overlap, not forgeable)
         result.hard_constraints["tool_info_used"] = self._determine_tool_info_used(
@@ -1135,6 +1300,62 @@ class TravelScorer:
                 and comp >= CODE_TOOL_USED_COMP_THRESHOLD_NONTRANSPORT
             )
 
+    def _compute_tool_diversity_multiplier(
+        self, tool_trace: List[Dict], problem: 'TravelProblem'
+    ) -> float:
+        """Compute tool diversity multiplier based on tool tier coverage.
+
+        Categorizes tools into three sets:
+        - successful_tools: called with valid results
+        - attempted_tools: called but got errors/empty results
+        - never_called: not called at all
+
+        Penalties for missing should_call tools, bonuses for nice_to_have.
+        Distinguishes "tried but failed" from "never tried".
+
+        Returns: multiplier in [DIVERSITY_FLOOR, 1.1]
+        """
+        tiers = TOOL_TIERS_BY_TYPE.get(problem.problem_type)
+        if not tiers:
+            return 1.0  # No diversity requirements for this type
+
+        should_call = tiers.get("should_call", set())
+        nice_to_have = tiers.get("nice_to_have", set())
+
+        if not should_call and not nice_to_have:
+            return 1.0  # Nothing to penalize/reward
+
+        # Build tool result sets
+        successful_tools = set()
+        attempted_tools = set()
+        for call in tool_trace:
+            name = call.get("name", "")
+            result = call.get("result", {})
+            if self._check_valid_result(result):
+                successful_tools.add(name)
+            else:
+                attempted_tools.add(name)
+
+        multiplier = 1.0
+
+        # Penalty for missing should_call tools
+        for tool in should_call:
+            if tool in successful_tools:
+                continue  # OK, tool was successfully called
+            elif tool in attempted_tools:
+                # Tried but failed — partial recovery
+                multiplier -= (DIVERSITY_SHOULD_CALL_PENALTY - DIVERSITY_ATTEMPTED_RECOVERY)
+            else:
+                # Never called at all — full penalty
+                multiplier -= DIVERSITY_SHOULD_CALL_PENALTY
+
+        # Bonus for nice_to_have tools
+        for tool in nice_to_have:
+            if tool in successful_tools:
+                multiplier += DIVERSITY_NICE_TO_HAVE_BONUS
+
+        return max(DIVERSITY_FLOOR, min(1.1, multiplier))
+
     def _check_required_args(self, tool_name: str, args: Dict) -> bool:
         required_args_map = {
             "poi_search": ["address"],
@@ -1200,7 +1421,9 @@ class TravelScorer:
 
     def _score_info_consistency(
         self, parsed: ParsedOutput, tool_trace: List[Dict],
-        tool_facts: ExtractedFacts, output_facts: ExtractedFacts
+        tool_facts: ExtractedFacts, output_facts: ExtractedFacts,
+        result: Optional['ScoreBreakdown'] = None,
+        problem: Optional['TravelProblem'] = None
     ) -> float:
         max_score = CODE_SCORE_WEIGHTS.get("info_consistency", 35.0)
         divisor = INFO_CONSISTENCY_RATIO_DIVISOR  # 0.6 — requires 60% overlap for full category score
@@ -1222,6 +1445,16 @@ class TravelScorer:
         total = 0
         categories_matched = 0
 
+        def _record_ic(cat_name: str, tool_count: int, matched_count, cat_score: float, weight: float = 1.0):
+            """Record IC category diagnostic if result is available."""
+            if result is not None:
+                result.ic_categories[cat_name] = {
+                    "tool_count": tool_count,
+                    "matched": matched_count if isinstance(matched_count, (int, float)) else int(matched_count),
+                    "score": round(cat_score, 4),
+                    "weight": weight,
+                }
+
         # Ratio-based scoring with minimum quantity gate + context-sensitive matching
         if tool_facts.flights:
             total += 1
@@ -1237,6 +1470,9 @@ class TravelScorer:
                 cat_score = self._ic_category_score(contextual_count, len(tool_facts.flights), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("flights", len(tool_facts.flights), contextual_count, cat_score)
+            else:
+                _record_ic("flights", len(tool_facts.flights), 0, 0.0)
 
         if tool_facts.trains:
             total += 1
@@ -1252,6 +1488,9 @@ class TravelScorer:
                 cat_score = self._ic_category_score(contextual_count, len(tool_facts.trains), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("trains", len(tool_facts.trains), contextual_count, cat_score)
+            else:
+                _record_ic("trains", len(tool_facts.trains), 0, 0.0)
 
         if tool_facts.pois:
             total += 1
@@ -1260,9 +1499,18 @@ class TravelScorer:
                 if HardConstraintChecker._fuzzy_poi_match(poi, output_text)
             )
             if matched_pois > 0:
-                cat_score = self._ic_category_score(matched_pois, len(tool_facts.pois), divisor)
+                effective_count = min(len(tool_facts.pois), IC_POI_DENOMINATOR_CAP)
+                cat_score = self._ic_category_score(matched_pois, effective_count, divisor)
+                # P5: POI density penalty — penalize excessive POI enumeration
+                if matched_pois > IC_POI_DENSITY_THRESHOLD:
+                    excess = matched_pois - IC_POI_DENSITY_THRESHOLD
+                    density_penalty = max(0.5, 1.0 - excess * IC_POI_DENSITY_DECAY)
+                    cat_score *= density_penalty
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("pois", len(tool_facts.pois), matched_pois, cat_score)
+            else:
+                _record_ic("pois", len(tool_facts.pois), 0, 0.0)
 
         if tool_facts.weather:
             total += 1
@@ -1271,22 +1519,31 @@ class TravelScorer:
                 cat_score = self._ic_category_score(len(overlap), len(tool_facts.weather), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("weather", len(tool_facts.weather), len(overlap), cat_score)
+            else:
+                _record_ic("weather", len(tool_facts.weather), 0, 0.0)
 
         if tool_facts.distances:
-            total += 1
             matched_dist = sum(1 for d in tool_facts.distances if d in output_text)
             if matched_dist > 0:
+                total += 1  # Bonus category: only count in denominator when matched
                 cat_score = self._ic_category_score(matched_dist, len(tool_facts.distances), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("distances", len(tool_facts.distances), matched_dist, cat_score)
+            else:
+                _record_ic("distances", len(tool_facts.distances), 0, 0.0)
 
         if tool_facts.times:
-            total += 1
             overlap = tool_facts.times & output_facts.times
             if overlap:
+                total += 1  # Bonus category: only count in denominator when matched
                 cat_score = self._ic_category_score(len(overlap), len(tool_facts.times), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("times", len(tool_facts.times), len(overlap), cat_score)
+            else:
+                _record_ic("times", len(tool_facts.times), 0, 0.0)
 
         if tool_facts.prices:
             total += 1
@@ -1297,6 +1554,9 @@ class TravelScorer:
                 cat_score = self._ic_category_score(len(overlap), len(tool_price_values), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("prices", len(tool_price_values), len(overlap), cat_score)
+            else:
+                _record_ic("prices", len(tool_price_values), 0, 0.0)
 
         if tool_facts.wind_info:
             total += 1
@@ -1305,33 +1565,71 @@ class TravelScorer:
                 cat_score = self._ic_category_score(len(overlap), len(tool_facts.wind_info), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("wind_info", len(tool_facts.wind_info), len(overlap), cat_score)
+            else:
+                _record_ic("wind_info", len(tool_facts.wind_info), 0, 0.0)
 
         if tool_facts.travel_durations:
-            total += 1
             matched_dur = sum(1 for d in tool_facts.travel_durations if d in output_text)
             if matched_dur > 0:
+                total += 1  # Bonus category: only count in denominator when matched
                 cat_score = self._ic_category_score(matched_dur, len(tool_facts.travel_durations), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("travel_durations", len(tool_facts.travel_durations), matched_dur, cat_score)
+            else:
+                _record_ic("travel_durations", len(tool_facts.travel_durations), 0, 0.0)
 
         if tool_facts.road_names:
-            total += 1
             matched_roads = sum(1 for road in tool_facts.road_names if road in output_text)
             if matched_roads > 0:
+                total += 1  # Bonus category: only count in denominator when matched
                 cat_score = self._ic_category_score(matched_roads, len(tool_facts.road_names), divisor)
                 matches += cat_score
                 categories_matched += 1
+                _record_ic("road_names", len(tool_facts.road_names), matched_roads, cat_score)
+            else:
+                _record_ic("road_names", len(tool_facts.road_names), 0, 0.0)
+
+        # Fix 3: IC phantom categories — add phantom denominator entries for
+        # direction-derived categories when direction was required but never called.
+        # This prevents the denominator from shrinking when direction data is missing,
+        # which would artificially inflate IC for models that skip direction.
+        if problem is not None:
+            called_tools_ic = set(call.get("name", "") for call in tool_trace)
+            required_ic = set(problem.required_tools) if problem.required_tools else set()
+            if "direction" in required_ic and "direction" not in called_tools_ic:
+                # Add phantom entries for distances and travel_durations (0 matches each)
+                total += 2
+                _record_ic("phantom_distances", 0, 0, 0.0)
+                _record_ic("phantom_travel_durations", 0, 0, 0.0)
 
         if total == 0:
             return max_score * 0.3
+
+        # P5: Cap any single category's contribution to IC_CATEGORY_MAX_SHARE of total
+        if result is not None and result.ic_categories:
+            max_allowed = IC_CATEGORY_MAX_SHARE * total if total > 0 else float('inf')
+            capped_matches = 0.0
+            for cat_name, cat_data in result.ic_categories.items():
+                cat_s = cat_data.get("score", 0.0)
+                capped_matches += min(cat_s, max_allowed)
+            # Use capped matches if they differ
+            if capped_matches < matches:
+                matches = capped_matches
 
         consistency_rate = matches / total
 
         # Coverage breadth multiplier: penalize referencing too few categories
         # Use proportional threshold (half of available categories, min 2)
-        # Harsh penalty (0.3x) to prevent cherry-picking easy categories
-        if total >= INFO_CONSISTENCY_MIN_BREADTH_TOTAL:
-            min_breadth = max(2, (total + 1) // 2)
+        # Exclude bonus categories from breadth calculation (they're direction-derived
+        # and often unmatchable, so shouldn't penalize breadth)
+        total_non_bonus = total - sum(
+            1 for cat_name in ("distances", "times", "travel_durations", "road_names")
+            if result and cat_name in result.ic_categories and result.ic_categories[cat_name].get("score", 0) > 0
+        )
+        if total_non_bonus >= INFO_CONSISTENCY_MIN_BREADTH_TOTAL:
+            min_breadth = max(2, (total_non_bonus + 1) // 2)
             if categories_matched < min_breadth:
                 consistency_rate *= IC_BREADTH_PENALTY_MULTIPLIER
 
@@ -1543,14 +1841,77 @@ class TravelScorer:
             return min(1.0, poi_in_days / target_pois)
         return 0.0  # No POI data = no grounding possible
 
-    def _score_completeness(self, parsed: ParsedOutput, problem: TravelProblem, tool_facts: ExtractedFacts) -> float:
+    @staticmethod
+    def _check_poi_freshness(output_facts: 'ExtractedFacts', tool_facts: 'ExtractedFacts') -> float:
+        """Check if output POIs come from current tool results, not memorized knowledge (P4).
+
+        Returns ratio of output POIs that appear in tool results.
+        Low ratio suggests memorization (POIs from training data, not tool calls).
+        """
+        if not output_facts.pois:
+            return 1.0  # No POIs to check
+        from_tools = sum(1 for p in output_facts.pois
+                         if any(HardConstraintChecker._fuzzy_poi_match(tp, p)
+                                for tp in tool_facts.pois))
+        return from_tools / len(output_facts.pois) if output_facts.pois else 1.0
+
+    def _detect_template(self, text: str) -> float:
+        """Detect template-like output (P3). Returns penalty multiplier 0.3-1.0.
+
+        Signals:
+        1. High n-gram repetition ratio (same 4-grams appearing many times)
+        2. Low reasoning connector density in long text
+        3. Suspiciously uniform paragraph/line structure
+        """
+        # 1. N-gram repetition: ratio of unique n-grams to total
+        words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+|\d+', text)
+        if len(words) < 50:
+            return 1.0  # Too short to detect
+
+        ngrams = [tuple(words[i:i+4]) for i in range(len(words)-3)]
+        freq = Counter(ngrams)
+        total_ng = len(ngrams)
+        unique_ratio = len(freq) / max(total_ng, 1)
+
+        # 2. Reasoning connector density
+        reasoning_patterns = r'(因为|由于|所以|因此|建议|推荐|考虑到|综合|权衡|对比|相比|优先|适合)'
+        reasoning_count = len(re.findall(reasoning_patterns, text))
+
+        # 3. Line structure uniformity (check line-by-line, not paragraph)
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        if len(lines) >= 5:
+            lengths = [len(l) for l in lines]
+            mean_len = sum(lengths) / len(lengths)
+            cv = (sum((l - mean_len)**2 for l in lengths) / len(lengths))**0.5 / max(mean_len, 1)
+        else:
+            cv = 0.5  # Default
+
+        # Scoring: low unique ratio OR low reasoning OR uniform structure → penalty
+        penalty = 1.0
+        if unique_ratio < 0.5:  # Very repetitive (< 50% unique 4-grams)
+            penalty *= 0.4
+        elif unique_ratio < 0.7:  # Moderately repetitive
+            penalty *= 0.6
+        if reasoning_count < 5 and len(text) > 500:  # No reasoning in long text
+            penalty *= 0.7
+        if cv < 0.15 and len(lines) >= 10:  # Suspiciously uniform lines
+            penalty *= 0.8
+
+        return max(0.3, penalty)
+
+    def _score_completeness(self, parsed: ParsedOutput, problem: TravelProblem, tool_facts: ExtractedFacts, result: Optional['ScoreBreakdown'] = None) -> float:
         max_score = CODE_SCORE_WEIGHTS.get("completeness", 25.0)
         _s = max_score / 35.0  # Scale factor for sub-scores (hardcoded sums = 35)
         score = 0.0
         output_text = parsed.raw_text.lower()
         targets = self._get_completeness_targets(problem)
 
-        # Helper sets for grounding
+        def _record_comp(check_name: str, check_score: float):
+            """Record completeness sub-score diagnostic."""
+            if result is not None:
+                result.comp_subscores[check_name] = round(check_score, 4)
+
+        # Helper sets for grounding — no data = 0 score (no fallback)
         price_strs = set(str(v) for v in tool_facts.prices.values()) if tool_facts.prices else set()
         distance_strs = tool_facts.distances if tool_facts.distances else set()
         duration_strs = tool_facts.travel_durations if tool_facts.travel_durations else set()
@@ -1558,97 +1919,155 @@ class TravelScorer:
 
         if problem.problem_type == "intercity":
             # 5 checks x 7pts = 35 (scaled by _s)
-            score += self._check_with_verified_context(output_text, r'(航班|飞机|机票)', tool_facts.flights, 7.0 * _s, target_count=targets.get("flights", 0))
-            score += self._check_with_verified_context(output_text, r'(火车|高铁|动车|车次)', tool_facts.trains, 7.0 * _s, target_count=targets.get("trains", 0))
-            score += self._check_with_grounded_context(output_text, r'(出发|到达|发车|起飞)', r'\d{2}:\d{2}', time_strs, 7.0 * _s, target_count=targets.get("times", 0))
-            score += self._check_with_grounded_context(output_text, r'(价格|费用|票价)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("prices", 0))
-            score += self._check_with_grounded_context(output_text, r'(推荐|建议|最佳)', r'(推荐|建议|最佳).{5,}', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
+            s = self._check_with_verified_context(output_text, r'(航班|飞机|机票)', tool_facts.flights, 7.0 * _s, target_count=targets.get("flights", 0))
+            _record_comp("flights", s); score += s
+            s = self._check_with_verified_context(output_text, r'(火车|高铁|动车|车次)', tool_facts.trains, 7.0 * _s, target_count=targets.get("trains", 0))
+            _record_comp("trains", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(出发|到达|发车|起飞)', r'\d{2}:\d{2}', time_strs, 7.0 * _s, target_count=targets.get("times", 0))
+            _record_comp("times", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(价格|费用|票价)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("prices", 0))
+            _record_comp("prices", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(推荐|建议|最佳)', r'(推荐|建议|最佳).{5,}', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
+            _record_comp("pois", s); score += s
 
         elif problem.problem_type == "multiday":
             # day structure (7) + attractions (7) + dining (6) + lodging (5) + transport (5) + budget (5) = 35 (scaled by _s)
             days = self._count_days_mentioned(parsed.raw_text)
             day_ratio = min(1.0, days / max(1, problem.num_days))
+            s = 0.0
             if day_ratio > 0:
                 day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
-                score += 7.0 * _s * day_ratio * day_grounding
-            score += self._check_with_grounded_context(output_text, r'(景点|游览|参观)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙|塔|楼|湖|山)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
-            score += self._check_with_grounded_context(output_text, r'(餐|吃|美食)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜|面|粉|饭)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
-            score += self._check_with_grounded_context(output_text, r'(住宿|酒店|宾馆)', r'([\u4e00-\u9fa5]{2,}(酒店|宾馆|民宿|客栈)|[三四五]星)', tool_facts.pois, 5.0 * _s, use_fuzzy=True, target_count=targets.get("lodging", 0))
-            score += self._check_with_grounded_context(output_text, r'(交通|出行)', r'(打车|地铁|公交|步行|骑行|\d+路|\d+号线)', distance_strs | duration_strs, 5.0 * _s, target_count=targets.get("transport_info", 0))
-            # Budget: require price data for full grounding; minimal structural credit without
-            if price_strs:
-                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 5.0 * _s, target_count=targets.get("budget_items", 0))
+                s = 7.0 * _s * day_ratio * day_grounding
+            _record_comp("day_structure", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(景点|游览|参观)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙|塔|楼|湖|山)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
+            _record_comp("attractions", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(餐|吃|美食)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜|面|粉|饭)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
+            _record_comp("dining", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(住宿|酒店|宾馆)', r'([\u4e00-\u9fa5]{2,}(酒店|宾馆|民宿|客栈)|[三四五]星)', tool_facts.pois, 5.0 * _s, use_fuzzy=True, target_count=targets.get("lodging", 0))
+            _record_comp("lodging", s); score += s
+            grounding = distance_strs | duration_strs
+            if grounding:
+                s = self._check_with_grounded_context(output_text, r'(交通|出行)', r'(打车|地铁|公交|步行|骑行|\d+路|\d+号线)', grounding, 5.0 * _s, target_count=targets.get("transport_info", 0))
             else:
-                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
-                    score += 5.0 * _s * STRUCTURAL_CREDIT_RATIO
+                s = 0.0  # No distance/duration data = no transport_info score
+            _record_comp("transport_info", s); score += s
+            if price_strs:
+                s = self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 5.0 * _s, target_count=targets.get("budget_items", 0))
+            else:
+                s = 0.0  # No price data = no budget score
+            _record_comp("budget", s); score += s
 
         elif problem.problem_type == "hybrid":
             # transport (8) + days (7) + attractions (6) + dining (5) + budget (5) + weather (4) = 35 (scaled by _s)
-            score += self._check_with_verified_context(output_text, r'(航班|火车|高铁)', tool_facts.flights | tool_facts.trains, 8.0 * _s, target_count=targets.get("transport", 0))
+            s = self._check_with_verified_context(output_text, r'(航班|火车|高铁)', tool_facts.flights | tool_facts.trains, 8.0 * _s, target_count=targets.get("transport", 0))
+            _record_comp("transport", s); score += s
             days = self._count_days_mentioned(parsed.raw_text)
+            s = 0.0
             if days > 0:
                 day_ratio = min(1.0, days / max(1, problem.num_days))
                 day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
-                score += 7.0 * _s * day_ratio * day_grounding
-            score += self._check_with_grounded_context(output_text, r'(景点|游览)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
-            score += self._check_with_grounded_context(output_text, r'(餐|吃)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜)', tool_facts.pois, 5.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
-            score += self._check_with_grounded_context(output_text, r'(预算|费用|总计)', r'\d+\s*元', price_strs, 5.0 * _s, target_count=targets.get("budget_items", 0))
-            score += self._check_with_grounded_context(output_text, r'(天气|气温|穿衣)', r'(晴|阴|多云|雨|雪|度)', tool_facts.weather, 4.0 * _s, target_count=targets.get("weather", 0))
+                s = 7.0 * _s * day_ratio * day_grounding
+            _record_comp("day_structure", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(景点|游览)', r'[\u4e00-\u9fa5]{2,}(景区|公园|博物馆|古镇|广场|寺|庙)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("pois", 0))
+            _record_comp("attractions", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(餐|吃)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店|小吃|菜)', tool_facts.pois, 5.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
+            _record_comp("dining", s); score += s
+            if price_strs:
+                s = self._check_with_grounded_context(output_text, r'(预算|费用|总计)', r'\d+\s*元', price_strs, 5.0 * _s, target_count=targets.get("budget_items", 0))
+            else:
+                s = 0.0  # No price data = no budget score
+            _record_comp("budget", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(天气|气温|穿衣)', r'(晴|阴|多云|雨|雪|度)', tool_facts.weather, 4.0 * _s, target_count=targets.get("weather", 0))
+            _record_comp("weather", s); score += s
 
         elif problem.problem_type == "single_poi":
             # visit plan (8) + nearby (7) + transport (7) + tips (7) + budget (6) = 35 (scaled by _s)
-            score += self._check_with_grounded_context(output_text, r'(游览|路线|安排)', r'(上午|下午|时间|小时)', tool_facts.pois, 8.0 * _s, use_fuzzy=True, target_count=targets.get("visit_items", 0))
-            score += self._check_with_grounded_context(output_text, r'(周边|附近)', r'[\u4e00-\u9fa5]{2,}(餐厅|咖啡|店|馆)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("nearby", 0))
-            score += self._check_with_grounded_context(output_text, r'(交通|距离|步行)', r'(\d+\s*(米|公里|分钟))', distance_strs | duration_strs, 7.0 * _s, target_count=targets.get("transport_info", 0))
-            # Tips: require price/time data for full grounding
+            s = self._check_with_grounded_context(output_text, r'(游览|路线|安排)', r'(上午|下午|时间|小时)', tool_facts.pois, 8.0 * _s, use_fuzzy=True, target_count=targets.get("visit_items", 0))
+            _record_comp("visit_plan", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(周边|附近)', r'[\u4e00-\u9fa5]{2,}(餐厅|咖啡|店|馆)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("nearby", 0))
+            _record_comp("nearby", s); score += s
+            grounding = distance_strs | duration_strs
+            if grounding:
+                s = self._check_with_grounded_context(output_text, r'(交通|距离|步行)', r'(\d+\s*(米|公里|分钟))', grounding, 7.0 * _s, target_count=targets.get("transport_info", 0))
+            else:
+                s = 0.0  # No distance/duration data = no transport_info score
+            _record_comp("transport_info", s); score += s
             if price_strs or time_strs:
-                score += self._check_with_grounded_context(output_text, r'(门票|开放|注意|建议)', r'(元|\d+:\d+|提前|携带)', price_strs | time_strs, 7.0 * _s, target_count=targets.get("tips", 0))
+                s = self._check_with_grounded_context(output_text, r'(门票|开放|注意|建议)', r'(元|\d+:\d+|提前|携带)', price_strs | time_strs, 7.0 * _s, target_count=targets.get("tips", 0))
             else:
-                if bool(re.search(r'(门票|开放|注意|建议)', output_text)) and bool(re.search(r'(元|\d+:\d+|提前|携带)', output_text)):
-                    score += 7.0 * _s * STRUCTURAL_CREDIT_RATIO
-            # Budget: require price data for full grounding
+                s = 0.0  # No price/time data = no tips score
+            _record_comp("tips", s); score += s
             if price_strs:
-                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 6.0 * _s, target_count=targets.get("budget_items", 0))
+                s = self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 6.0 * _s, target_count=targets.get("budget_items", 0))
             else:
-                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
-                    score += 6.0 * _s * STRUCTURAL_CREDIT_RATIO
+                s = 0.0  # No price data = no budget score
+            _record_comp("budget", s); score += s
 
         elif problem.problem_type == "food_tour":
             # restaurants (8) + recommendations (7) + route (7) + cost (7) + tips (6) = 35 (scaled by _s)
-            score += self._check_with_grounded_context(output_text, r'(美食|特色|小吃)', r'[\u4e00-\u9fa5]{2,}(店|馆|摊|铺|坊)', tool_facts.pois, 8.0 * _s, use_fuzzy=True, target_count=targets.get("restaurants", 0))
-            score += self._check_with_grounded_context(output_text, r'(推荐|必吃|招牌)', r'[\u4e00-\u9fa5]{2,}', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("dishes", 0))
-            score += self._check_with_grounded_context(output_text, r'(路线|顺序|区域)', r'(先|然后|接着|最后|步行|打车)', distance_strs | duration_strs, 7.0 * _s, target_count=targets.get("route_items", 0))
-            # Cost: require price data for full grounding
-            if price_strs:
-                score += self._check_with_grounded_context(output_text, r'(花费|人均|价格)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("cost_items", 0))
+            s = self._check_with_grounded_context(output_text, r'(美食|特色|小吃)', r'[\u4e00-\u9fa5]{2,}(店|馆|摊|铺|坊)', tool_facts.pois, 8.0 * _s, use_fuzzy=True, target_count=targets.get("restaurants", 0))
+            _record_comp("restaurants", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(推荐|必吃|招牌)', r'[\u4e00-\u9fa5]{2,}', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("dishes", 0))
+            _record_comp("dishes", s); score += s
+            grounding = distance_strs | duration_strs
+            if grounding:
+                s = self._check_with_grounded_context(output_text, r'(路线|顺序|区域)', r'(先|然后|接着|最后|步行|打车)', grounding, 7.0 * _s, target_count=targets.get("route_items", 0))
             else:
-                if bool(re.search(r'(花费|人均|价格)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
-                    score += 7.0 * _s * STRUCTURAL_CREDIT_RATIO
-            score += self._check_with_grounded_context(output_text, r'(建议|注意|小贴士)', r'(时间|排队|预约|人多|季节)', tool_facts.pois | tool_facts.weather, 6.0 * _s, use_fuzzy=True, target_count=targets.get("tips", 0))
+                s = 0.0  # No distance/duration data = no route score
+            _record_comp("route", s); score += s
+            if price_strs:
+                s = self._check_with_grounded_context(output_text, r'(花费|人均|价格)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("cost_items", 0))
+            else:
+                s = 0.0  # No price data = no cost score
+            _record_comp("cost", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(建议|注意|小贴士)', r'(时间|排队|预约|人多|季节)', tool_facts.pois | tool_facts.weather, 6.0 * _s, use_fuzzy=True, target_count=targets.get("tips", 0))
+            _record_comp("tips", s); score += s
 
         elif problem.problem_type == "business":
             # transport (8) + hotel (7) + dining (6) + cost (7) + business (7) = 35 (scaled by _s)
-            score += self._check_with_verified_context(output_text, r'(航班|高铁|火车)', tool_facts.flights | tool_facts.trains, 8.0 * _s, target_count=targets.get("transport", 0))
-            score += self._check_with_grounded_context(output_text, r'(酒店|住宿)', r'[\u4e00-\u9fa5]{2,}(酒店|宾馆|商务)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("hotels", 0))
-            score += self._check_with_grounded_context(output_text, r'(餐饮|餐厅)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
-            score += self._check_with_grounded_context(output_text, r'(费用|预算|差旅)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("costs", 0))
-            score += self._check_with_grounded_context(output_text, r'(商务|会议|配套)', r'[\u4e00-\u9fa5]{2,}(中心|酒店|厅|室)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("business", 0))
+            s = self._check_with_verified_context(output_text, r'(航班|高铁|火车)', tool_facts.flights | tool_facts.trains, 8.0 * _s, target_count=targets.get("transport", 0))
+            _record_comp("transport", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(酒店|住宿)', r'[\u4e00-\u9fa5]{2,}(酒店|宾馆|商务)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("hotels", 0))
+            _record_comp("hotels", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(餐饮|餐厅)', r'[\u4e00-\u9fa5]{2,}(餐厅|饭店)', tool_facts.pois, 6.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
+            _record_comp("dining", s); score += s
+            if price_strs:
+                s = self._check_with_grounded_context(output_text, r'(费用|预算|差旅)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("costs", 0))
+            else:
+                s = 0.0  # No price data = no costs score
+            _record_comp("costs", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(商务|会议|配套)', r'[\u4e00-\u9fa5]{2,}(中心|酒店|厅|室)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("business", 0))
+            _record_comp("business", s); score += s
 
         elif problem.problem_type == "family_study":
             # days (7) + child-friendly (7) + education (7) + dining/hotel (7) + budget (7) = 35 (scaled by _s)
             days = self._count_days_mentioned(parsed.raw_text)
+            s = 0.0
             if days > 0:
                 day_ratio = min(1.0, days / max(1, problem.num_days))
                 day_grounding = self._compute_day_grounding(output_text, tool_facts, problem.num_days)
-                score += 7.0 * _s * day_ratio * day_grounding
-            score += self._check_with_grounded_context(output_text, r'(亲子|儿童|孩子)', r'(适合|体力|休息|互动)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("child_items", 0))
-            score += self._check_with_grounded_context(output_text, r'(学习|教育|体验)', r'[\u4e00-\u9fa5]{2,}(馆|园|基地|中心)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("education", 0))
-            score += self._check_with_grounded_context(output_text, r'(餐厅|住宿)', r'(亲子|家庭|儿童)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
-            # Budget: require price data for full grounding
+                s = 7.0 * _s * day_ratio * day_grounding
+            _record_comp("day_structure", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(亲子|儿童|孩子)', r'(适合|体力|休息|互动)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("child_items", 0))
+            _record_comp("child_friendly", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(学习|教育|体验)', r'[\u4e00-\u9fa5]{2,}(馆|园|基地|中心)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("education", 0))
+            _record_comp("education", s); score += s
+            s = self._check_with_grounded_context(output_text, r'(餐厅|住宿)', r'(亲子|家庭|儿童)', tool_facts.pois, 7.0 * _s, use_fuzzy=True, target_count=targets.get("dining", 0))
+            _record_comp("dining", s); score += s
             if price_strs:
-                score += self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("budget_items", 0))
+                s = self._check_with_grounded_context(output_text, r'(预算|费用|花费)', r'\d+\s*元', price_strs, 7.0 * _s, target_count=targets.get("budget_items", 0))
             else:
-                if bool(re.search(r'(预算|费用|花费)', output_text)) and bool(re.search(r'\d+\s*元', output_text)):
-                    score += 7.0 * _s * STRUCTURAL_CREDIT_RATIO
+                s = 0.0  # No price data = no budget score
+            _record_comp("budget", s); score += s
+
+        # P3: Template detection penalty — penalize repetitive/templated outputs
+        template_multiplier = self._detect_template(parsed.raw_text)
+        score *= template_multiplier
+
+        # P3: Fact integration quality — require reasoning connectors near tool facts
+        reasoning_patterns = r'(因为|由于|所以|因此|建议|推荐|考虑到|综合|权衡|对比|相比|优先|适合)'
+        reasoning_count = len(re.findall(reasoning_patterns, parsed.raw_text))
+        if reasoning_count < FACT_INTEGRATION_MIN_REASONING and len(parsed.raw_text) > 500:
+            score *= FACT_INTEGRATION_PENALTY
 
         return min(max_score, round(score, 2))
