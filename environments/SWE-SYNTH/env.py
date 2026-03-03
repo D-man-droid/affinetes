@@ -135,6 +135,9 @@ class SynthActor:
         self.dockerfiles_dir = dockerfiles_dir
         self.run_scripts_dir = run_scripts_dir
 
+        # Authenticate with Docker Hub to avoid pull rate limits
+        self._setup_docker_auth()
+
         # Initialize two-level cache (read-only)
         self.cache = TwoLevelCache(
             local_cache_dir=cache_dir,
@@ -159,6 +162,25 @@ class SynthActor:
 
         # OpenEnv: load agent config from config.yaml
         self._agent_config = self._load_agent_config()
+
+    def _setup_docker_auth(self) -> None:
+        """Log in to Docker Hub using DOCKERHUB_USERNAME and DOCKERHUB_TOKEN env vars."""
+        username = os.getenv("DOCKER_HUB_USERNAME")
+        token = os.getenv("DOCKER_HUB_TOKEN")
+        if not username or not token:
+            print("[SWE-SYNTH] DOCKER_HUB_USERNAME/DOCKER_HUB_TOKEN not set, skipping docker login")
+            return
+        result = subprocess.run(
+            ["docker", "login", "-u", username, "--password-stdin"],
+            input=token,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            print(f"[SWE-SYNTH] Docker Hub login succeeded for {username}")
+        else:
+            print(f"[SWE-SYNTH] Warning: Docker Hub login failed: {result.stderr.strip()}")
 
     def _cleanup_stale_containers(self, min_age_minutes: int = 2):
         """
