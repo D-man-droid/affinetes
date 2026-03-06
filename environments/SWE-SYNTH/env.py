@@ -195,7 +195,7 @@ class SynthActor:
 
             # Build filter args: by name prefix + by sweap-images ancestor
             filter_args_list = []
-            for name_filter in ["ridge-proxy-", "ridges-sandbox-", "swe-synth-fixer-", "swe-synth-openenv-", "minisweagent-"]:
+            for name_filter in ["ridge-proxy-", "ridges-sandbox-", "swe-synth-fixer-", "swe-synth-openenv-", "minisweagent-", "swe-verify-", "swe-expand-"]:
                 filter_args_list.append(["--filter", f"name={name_filter}"])
             filter_args_list.append(["--filter", f"ancestor={self.dockerhub_username}/sweap-images"])
 
@@ -522,6 +522,7 @@ fi
                     ["docker", "run", "--rm", "--init", "-i",
                      "--name", verify_ctr,
                      "--stop-timeout", "10",
+                     "--memory", "4g",
                      "--network=host", "--entrypoint", "/bin/bash", image],
                     input=full_script,
                     capture_output=True,
@@ -674,6 +675,7 @@ fi
                     ["docker", "run", "--rm", "--init", "-i",
                      "--name", expand_ctr,
                      "--stop-timeout", "10",
+                     "--memory", "4g",
                      "--network=host", "--entrypoint", "/bin/bash", docker_image],
                     input=full_script,
                     capture_output=True,
