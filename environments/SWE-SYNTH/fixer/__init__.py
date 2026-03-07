@@ -3,7 +3,7 @@
 from typing import Literal
 from .base import BaseFixerAgent, FixerConfig, FixerResult
 
-AgentType = Literal["miniswe", "ridge", "swe-agent", "codex"]
+AgentType = Literal["miniswe", "swe-agent", "codex"]
 
 
 def create_fixer_agent(agent_type: AgentType, config: FixerConfig) -> BaseFixerAgent:
@@ -11,9 +11,6 @@ def create_fixer_agent(agent_type: AgentType, config: FixerConfig) -> BaseFixerA
     if agent_type == "miniswe":
         from .miniswe import MiniSWEFixerAgent
         return MiniSWEFixerAgent(config)
-    elif agent_type == "ridge":
-        from .ridge import RidgeFixerAgent
-        return RidgeFixerAgent(config)
     elif agent_type == "swe-agent":
         from .stub import SWEAgentFixerAgent
         return SWEAgentFixerAgent(config)

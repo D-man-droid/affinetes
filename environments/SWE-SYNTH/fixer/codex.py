@@ -7,7 +7,7 @@ import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 
 from .base import BaseFixerAgent, FixerConfig, FixerResult
-from utils import SANITIZE_GIT_SCRIPT, DIFF_EXTENSIONS
+from utils import DIFF_EXTENSIONS
 
 DOCKER_PULL_TIMEOUT = 300
 
@@ -50,38 +50,6 @@ class CodexFixerAgent(BaseFixerAgent):
             timeout=timeout,
             input=stdin_data,
         )
-
-    def _apply_patches(
-        self,
-        gold_patch: Optional[str],
-        bug_patch: Optional[str],
-    ) -> bool:
-        """Apply gold_patch and bug_patch inside the container using docker cp."""
-        for idx, (name, patch) in enumerate([("gold", gold_patch), ("bug", bug_patch)]):
-            if patch:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".diff", delete=False
-                ) as f:
-                    f.write(patch)
-                    temp_path = f.name
-                try:
-                    subprocess.run(
-                        ["docker", "cp", temp_path,
-                         f"{self._container_name}:/tmp/patch_{idx}.diff"],
-                        check=True, capture_output=True, timeout=30,
-                    )
-                    result = self._exec_in_container(
-                        f"cd /app && git apply -v /tmp/patch_{idx}.diff 2>&1",
-                        timeout=120,
-                    )
-                    if result.returncode != 0:
-                        print(f"[CODEX] Warning: {name}_patch may have failed: "
-                              f"{result.stdout[:500]}")
-                    else:
-                        print(f"[CODEX] {name}_patch applied successfully")
-                finally:
-                    os.unlink(temp_path)
-        return True
 
     def _install_codex(self) -> bool:
         """Copy pre-built codex binary into the SWE-bench container."""
@@ -221,25 +189,20 @@ class CodexFixerAgent(BaseFixerAgent):
                     error=f"Failed to start container: {run_result.stderr}",
                 )
 
-            # 3. Apply patches
-            if gold_patch or bug_patch:
-                self._apply_patches(gold_patch, bug_patch)
+            # 3. Apply patches, sanitize git history, normalize timestamps
+            self._prepare_container(gold_patch, bug_patch)
 
-            # 4. Sanitize git history
-            self._exec_in_container(SANITIZE_GIT_SCRIPT, timeout=60)
-            print("[CODEX] Git history sanitized")
-
-            # 5. Install codex CLI in container
+            # 4. Install codex CLI in container
             if not self._install_codex():
                 return FixerResult(
                     patch="", success=False,
                     error="Failed to install Codex CLI in container",
                 )
 
-            # 6. Write codex config (sets wire_api, model, provider)
+            # 5. Write codex config (sets wire_api, model, provider)
             self._write_codex_config()
 
-            # 7. Run codex exec (pass prompt via stdin to avoid shell escaping)
+            # 6. Run codex exec (pass prompt via stdin to avoid shell escaping)
             codex_env = {"CODEX_API_KEY": self.config.api_key}
 
             codex_cmd = (
@@ -263,7 +226,7 @@ class CodexFixerAgent(BaseFixerAgent):
                     error=f"Codex timed out after {self.config.timeout}s",
                 )
 
-            # 8. Parse JSON output
+            # 7. Parse JSON output
             total_tokens, model_calls, conversation = \
                 self._parse_codex_json_output(result.stdout)
 
@@ -287,7 +250,7 @@ class CodexFixerAgent(BaseFixerAgent):
                     error=f"Codex failed to start (exit {result.returncode}): {error_detail}",
                 )
 
-            # 9. Extract diff from container
+            # 8. Extract diff from container
             diff_result = self._exec_in_container(
                 f"cd /app && git add -A && git diff --cached -- {DIFF_EXTENSIONS}",
                 timeout=60,

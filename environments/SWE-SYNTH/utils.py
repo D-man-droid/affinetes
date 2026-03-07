@@ -33,7 +33,7 @@ echo "Git history sanitized"
 # Normalize all file timestamps to the same value to prevent fingerprinting via mtime
 NORMALIZE_TIMESTAMPS_SCRIPT = """
 cd /app
-find . -not -path './.git/*' -exec touch -t 202001010000 {} + 2>/dev/null || true
+find . -not -path './.git/*' -not -path './node_modules/*' -not -path './.venv/*' -not -path './vendor/*' -exec touch -t 202001010000 {} + 2>/dev/null || true
 echo "Timestamps normalized"
 """
 

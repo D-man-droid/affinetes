@@ -4,7 +4,6 @@ import os
 import re
 import sys
 import asyncio
-import tempfile
 import time
 import logging
 import subprocess
@@ -14,7 +13,7 @@ from typing import Optional
 import yaml
 
 from .base import BaseFixerAgent, FixerConfig, FixerResult
-from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, is_blacklisted_command
+from utils import is_blacklisted_command
 
 
 def _strip_thinking_tags(content: str) -> str:
@@ -58,90 +57,6 @@ class MiniSWEFixerAgent(BaseFixerAgent):
         self._env = None
         self._agent = None
         self._container_name = None
-
-    def _sanitize_git_history(self) -> bool:
-        """Remove git history to prevent cheating by looking at past commits."""
-        if not self._env:
-            return False
-
-        try:
-            result = self._env.execute(SANITIZE_GIT_SCRIPT, timeout=60)
-            result_str = result.get("stdout", "") if isinstance(result, dict) else str(result or "")
-            print(f"[SWE-SYNTH] Git history sanitization: {result_str[:200] if result_str else 'done'}")
-            return True
-        except Exception as e:
-            print(f"[SWE-SYNTH] Warning: Failed to sanitize git history: {e}")
-            return False
-
-    def _apply_patches(
-        self,
-        gold_patch: Optional[str],
-        bug_patch: Optional[str],
-    ) -> bool:
-        """Apply gold_patch and bug_patch inside container using docker cp.
-
-        Note: SWE-bench Docker images are already at base_commit, no need to reset.
-
-        Returns:
-            True if patches applied successfully, False otherwise.
-
-        Raises:
-            RuntimeError: If patch application fails critically.
-        """
-        if not self._env or not self._container_name:
-            return False
-
-        patch_names = ["gold_patch", "bug_patch"]
-
-        # Apply patches using docker cp to avoid argument length limits
-        for idx, patch in enumerate([gold_patch, bug_patch]):
-            if patch:
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.diff', delete=False) as f:
-                    f.write(patch)
-                    temp_path = f.name
-                try:
-                    subprocess.run(
-                        ["docker", "cp", temp_path, f"{self._container_name}:/tmp/patch_{idx}.diff"],
-                        check=True, capture_output=True, timeout=30
-                    )
-                    # Apply patch and capture result (no || true - we want to see failures)
-                    result = self._env.execute(
-                        f"cd /app && git apply -v /tmp/patch_{idx}.diff 2>&1",
-                        timeout=120
-                    )
-                    # Handle result (may be dict or string depending on environment)
-                    if isinstance(result, dict):
-                        result_str = result.get("stdout", "") or result.get("output", "") or str(result)
-                    else:
-                        result_str = str(result) if result else ""
-                    # Check for apply errors
-                    result_lower = result_str.lower()
-                    if "error" in result_lower or "rejected" in result_lower or "patch failed" in result_lower:
-                        print(f"[SWE-SYNTH] Warning: {patch_names[idx]} may have failed to apply: {result_str[:500]}")
-                    else:
-                        print(f"[SWE-SYNTH] {patch_names[idx]} applied successfully")
-                finally:
-                    os.unlink(temp_path)
-
-        # Sanitize git history to prevent cheating via git log/show
-        self._sanitize_git_history()
-
-        # Normalize timestamps to prevent fingerprinting via mtime
-        try:
-            self._env.execute(NORMALIZE_TIMESTAMPS_SCRIPT, timeout=60)
-        except Exception as e:
-            print(f"[SWE-SYNTH] Warning: Failed to normalize timestamps: {e}")
-
-        # Verify code state after patches
-        git_status_raw = self._env.execute("cd /app && git status --porcelain", timeout=30)
-        git_diff_raw = self._env.execute("cd /app && git diff --stat", timeout=30)
-        # Handle result (may be dict or string)
-        git_status = git_status_raw.get("stdout", "") if isinstance(git_status_raw, dict) else str(git_status_raw or "")
-        git_diff_stat = git_diff_raw.get("stdout", "") if isinstance(git_diff_raw, dict) else str(git_diff_raw or "")
-        print(f"[SWE-SYNTH] Post-patch git status: {git_status[:200] if git_status else 'clean'}")
-        print(f"[SWE-SYNTH] Post-patch git diff stat: {git_diff_stat[:200] if git_diff_stat else 'no changes'}")
-
-        return True
 
     async def fix(
         self,
@@ -227,9 +142,8 @@ class MiniSWEFixerAgent(BaseFixerAgent):
                 container_timeout=str(self.config.timeout),
             )
 
-            # Apply patches (image is already at base_commit)
-            if gold_patch or bug_patch:
-                self._apply_patches(gold_patch, bug_patch)
+            # Apply patches, sanitize git history, normalize timestamps
+            self._prepare_container(gold_patch, bug_patch)
 
             # Load agent config
             config_path = Path(__file__).parent.parent / "config.yaml"

@@ -1250,7 +1250,7 @@ fi
             model: Model for fixing bugs
             base_url: API base URL
             api_key: API key (uses env var CHUTES_API_KEY if not provided)
-            fixer_agent: Agent type for bug fixing ("miniswe", "ridge")
+            fixer_agent: Agent type for bug fixing ("miniswe", "codex")
             timeout: Timeout for commands
             temperature: Model temperature for fixer
             seed: Random seed for LLM inference
