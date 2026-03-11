@@ -59,3 +59,5 @@ logs/
 
 # uv
 .python-version
+# OMC state
+.omc/
