@@ -396,23 +396,36 @@ class Actor:
         # If tool calls exist, execute using MCPState
         logger.debug("step: tool_calls=%d, current_step=%d, MAX=%d", len(tool_calls) if tool_calls else 0, ep.current_step, MAX_TOOL_STEPS)
         if tool_calls and ep.current_step <= MAX_TOOL_STEPS:
-            # Chutes API workaround: Convert assistant's tool_calls to text format
-            # because Chutes API doesn't support OpenAI's tool_calls format
-            tool_call_descriptions = []
+            # Normalize: ensure every tool_call has a stable id
+            for tc in tool_calls:
+                if not tc.get("id"):
+                    tc["id"] = f"call_{uuid.uuid4().hex[:24]}"
+
+            # Standard OpenAI assistant message with tool_calls
+            tc_list = []
             for tc in tool_calls:
                 func = tc.get("function", {})
-                name = func.get("name", "unknown")
-                args = func.get("arguments", "{}")
-                tool_call_descriptions.append(f"调用工具: {name}({args})")
-
-            assistant_content = action or ""
-            if tool_call_descriptions:
-                if assistant_content:
-                    assistant_content += "\n\n"
-                assistant_content += "正在调用以下工具:\n" + "\n".join(tool_call_descriptions)
-
-            ep.conversation.append({"role": "assistant", "content": assistant_content})
-            logger.debug("Assistant message (tool calls converted to text)")
+                raw_args = func.get("arguments", "{}")
+                # Ensure arguments is a JSON string (some models return dict)
+                if not isinstance(raw_args, str):
+                    raw_args = json.dumps(raw_args, ensure_ascii=False)
+                tc_list.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": func.get("name", "unknown"),
+                        "arguments": raw_args,
+                    },
+                })
+            assistant_msg = {
+                "role": "assistant",
+                "tool_calls": tc_list,
+            }
+            # OpenAI spec: content is optional when tool_calls present
+            if action:
+                assistant_msg["content"] = action
+            ep.conversation.append(assistant_msg)
+            logger.debug("Assistant message with %d tool_calls", len(tc_list))
         else:
             # No tool calls, add assistant message directly
             ep.conversation.append({"role": "assistant", "content": action or ""})
@@ -423,7 +436,7 @@ class Actor:
             for call in tool_calls:
                 func = call.get("function", {})
                 name = func.get("name", "")
-                call_id = call.get("id", str(uuid.uuid4()))
+                call_id = call["id"]  # Use the normalized id from above
 
                 # Parse arguments
                 args_str = func.get("arguments", "{}")
@@ -433,7 +446,6 @@ class Actor:
                     args = {}
 
                 # ==================== Use QQR's MCPState to call tools ====================
-                # Construct OpenAI format tool_call
                 tool_call_dict = {
                     "id": call_id,
                     "function": {
@@ -481,20 +493,14 @@ class Actor:
                     "result": self._truncate_tool_result(result_content, max_chars=3000),
                 })
 
-            # Combine all tool results into one user message (Chutes API workaround)
-            # because Chutes API may not fully support tool role
-            combined_results = "\n\n".join(
-                f"[工具调用: {r['tool']}]\n结果:\n{r['result']}"
-                for r in tool_results
-            )
-
-            # Neutral hint — do not reveal which tools are missing (P6 anti-hack)
-            hint = "\n\n请根据已获取的信息继续。如需更多信息，请调用相关工具；如信息充分，请提供详细的规划方案。"
-
-            ep.conversation.append({
-                "role": "user",
-                "content": f"以下是工具调用结果：\n\n{combined_results}{hint}"
-            })
+            # Standard OpenAI tool role: one message per tool result,
+            # keyed by tool_call_id so the model can match request → response
+            for r in tool_results:
+                ep.conversation.append({
+                    "role": "tool",
+                    "tool_call_id": r["call_id"],
+                    "content": r["result"],
+                })
 
             observation = self._format_tool_results(tool_results)
             # Average step reward for this batch of tool calls
@@ -972,7 +978,7 @@ class Actor:
             message = choice.get("message", {})
 
             return {
-                "content": message.get("content", ""),
+                "content": message.get("content") or "",
                 "tool_calls": message.get("tool_calls"),
                 "usage": data.get("usage", {}),
             }
