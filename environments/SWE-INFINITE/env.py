@@ -206,25 +206,19 @@ class InfiniteActor:
         self,
         api_key: Optional[str] = None,
         cache_dir: str = "/tmp/swe-infinite-cache",
-        # R2 private bucket (credentials via env vars or constructor)
-        r2_endpoint: Optional[str] = None,
-        r2_access_key: Optional[str] = None,
-        r2_secret_key: Optional[str] = None,
-        r2_bucket: str = "swe-infinite",
-        r2_prefix: str = "",
+        # R2 public bucket
+        r2_base_url: Optional[str] = None,
+        r2_prefix: Optional[str] = None,
     ):
         self.api_key = api_key or os.getenv("CHUTES_API_KEY")
 
         # Authenticate with Docker Hub to avoid pull rate limits
         self._setup_docker_auth()
 
-        # Initialize two-level cache (R2 credentials from env vars if not passed)
+        # Initialize two-level cache (L1 local + L2 R2 public HTTP)
         self.cache = TwoLevelCache(
             local_cache_dir=cache_dir,
-            r2_endpoint=r2_endpoint,
-            r2_access_key=r2_access_key,
-            r2_secret_key=r2_secret_key,
-            r2_bucket=r2_bucket,
+            r2_base_url=r2_base_url,
             r2_prefix=r2_prefix,
         )
 
@@ -343,7 +337,7 @@ class InfiniteActor:
         """Verify if the agent's patch passes the required tests.
 
         The Docker image already has test_patch baked in (base_commit + test_patch).
-        We only need to apply fix_patch and run test_command.
+        We apply augmented_test_patch (if present), then fix_patch, then run tests.
 
         Returns:
             (score, test_stats) where score is 1.0 if all required tests pass.
@@ -355,6 +349,8 @@ class InfiniteActor:
         test_command = task.get("test_command", "pytest -v --tb=no")
         fail_to_pass = task.get("fail_to_pass", [])
         pass_to_pass = task.get("pass_to_pass", [])
+        test_patch = task.get("test_patch", "")
+        augmented_test_patch = task.get("augmented_test_patch", "")
 
         # Ensure lists (may be stored as JSON strings)
         if isinstance(fail_to_pass, str):
@@ -376,8 +372,17 @@ class InfiniteActor:
 
         try:
             # Build verification entry script
+            # Apply order: test_patch -> augmented_test_patch -> fix_patch
+            apply_steps = []
+            if test_patch and test_patch.strip():
+                apply_steps.append("git apply -v --allow-empty /workspace/test_patch.diff")
+            if augmented_test_patch and augmented_test_patch.strip():
+                apply_steps.append("git apply -v --allow-empty /workspace/augmented_test.diff")
+            apply_cmds = "\n".join(apply_steps)
+
             entryscript = f"""
 cd /app
+{apply_cmds}
 git apply -v /workspace/fix_patch.diff
 {test_command} > /workspace/stdout.log 2> /workspace/stderr.log || true
 python3 /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json
@@ -387,8 +392,20 @@ python3 /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /worksp
             parser_b64 = base64.b64encode(PARSER_SCRIPT.encode('utf-8')).decode('ascii')
             entryscript_b64 = base64.b64encode(entryscript.encode('utf-8')).decode('ascii')
 
+            # Encode test patches if present
+            test_patch_lines = ""
+            if test_patch and test_patch.strip():
+                tp_b64 = base64.b64encode(test_patch.encode('utf-8')).decode('ascii')
+                test_patch_lines = f'echo "{tp_b64}" | base64 -d > /workspace/test_patch.diff'
+            augmented_lines = ""
+            if augmented_test_patch and augmented_test_patch.strip():
+                aug_b64 = base64.b64encode(augmented_test_patch.encode('utf-8')).decode('ascii')
+                augmented_lines = f'echo "{aug_b64}" | base64 -d > /workspace/augmented_test.diff'
+
             full_script = f"""#!/bin/bash
 mkdir -p /workspace
+{test_patch_lines}
+{augmented_lines}
 echo "{fix_patch_b64}" | base64 -d > /workspace/fix_patch.diff
 echo "{parser_b64}" | base64 -d > /workspace/parser.py
 echo "{entryscript_b64}" | base64 -d > /workspace/entryscript.sh
@@ -545,6 +562,13 @@ fi
             output = e.output.decode("utf-8", errors="replace") if e.output else ""
             return {"output": output, "returncode": -1, "timeout": True}
 
+    def _apply_patch_in_container(self, container_id: str, patch: str, label: str = "augmented test") -> None:
+        """Apply a patch inside a running container via base64 pipe."""
+        patch_b64 = base64.b64encode(patch.encode('utf-8')).decode('ascii')
+        cmd = f"echo '{patch_b64}' | base64 -d | git apply -v --allow-empty"
+        result = self._execute_in_container(container_id, cmd, timeout=60)
+        print(f"[SWE-INFINITE] Applied {label} patch: {result.get('output', '')[:200]}")
+
     def _sanitize_git_in_container(self, container_id: str) -> None:
         """Sanitize git history to prevent cheating."""
         result = self._execute_in_container(container_id, SANITIZE_GIT_SCRIPT, timeout=60)
@@ -615,7 +639,7 @@ fi
             episode_id = uuid.uuid4().hex
             container_name = f"swe-infinite-openenv-{episode_id[:8]}"
 
-            # Start container (image already has base_commit + test_patch)
+            # Start container (image has base_commit only)
             container_id = self._start_container(docker_image, container_name)
 
             # Sanitize git history
@@ -852,7 +876,7 @@ fi
         agent = select_agent(task, override=agent)
         print(f"[SWE-INFINITE] Loaded task: {instance_id} (agent={agent})")
 
-        # Create and run agent
+        # Create and run agent (no test patches — agent should not see test cases)
         solve_kwargs = dict(
             problem_statement=problem_statement,
             docker_image=docker_image,

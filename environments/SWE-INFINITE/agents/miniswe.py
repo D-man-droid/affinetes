@@ -81,6 +81,17 @@ class MiniSWEAgent:
         self._agent = None
         self._container_name: Optional[str] = None
 
+    def _apply_patch(self, patch: str, label: str = "augmented test") -> None:
+        """Apply a patch inside the container via base64 pipe."""
+        import base64
+        patch_b64 = base64.b64encode(patch.encode('utf-8')).decode('ascii')
+        result = subprocess.run(
+            ["docker", "exec", self._container_name, "bash", "-c",
+             f"cd /app && echo '{patch_b64}' | base64 -d | git apply -v --allow-empty"],
+            capture_output=True, text=True, timeout=60,
+        )
+        print(f"[MINISWE] Applied {label} patch: {result.stdout[:200]}")
+
     def _prepare_container(self) -> None:
         """Sanitize git history and normalize timestamps (no patches to apply)."""
         result = subprocess.run(

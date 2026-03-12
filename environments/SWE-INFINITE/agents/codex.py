@@ -140,6 +140,16 @@ class CodexAgent:
 
         return total_input + total_output, model_calls, conversation
 
+    def _apply_patch(self, patch: str, label: str = "augmented test") -> None:
+        """Apply a patch inside the container via base64 pipe."""
+        import base64
+        patch_b64 = base64.b64encode(patch.encode('utf-8')).decode('ascii')
+        result = self._exec(
+            f"cd /app && echo '{patch_b64}' | base64 -d | git apply -v --allow-empty",
+            timeout=60,
+        )
+        print(f"[CODEX] Applied {label} patch: {result.stdout[:200]}")
+
     def _prepare_container(self) -> None:
         """Sanitize git history and normalize timestamps."""
         result = self._exec(SANITIZE_GIT_SCRIPT, timeout=60)
