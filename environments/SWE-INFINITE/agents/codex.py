@@ -292,11 +292,18 @@ class CodexAgent:
 
             if result.returncode != 0 and model_calls == 0:
                 error_detail = (result.stderr or result.stdout or "")[:500]
+                # Classify the error from stdout/stderr content
+                if any(kw in error_detail for kw in ("404", "No matching chute", "not found", "authentication", "401", "403")):
+                    error_prefix = "api_error"
+                elif any(kw in error_detail for kw in ("Reconnecting", "connection", "network", "timeout")):
+                    error_prefix = "api_error"
+                else:
+                    error_prefix = "codex_error"
                 return CodexResult(
                     patch="", success=False,
                     model_calls=0, total_tokens=0,
                     conversation=conversation,
-                    error=f"Codex failed to start (exit {result.returncode}): {error_detail}",
+                    error=f"{error_prefix}: exit {result.returncode}: {error_detail}",
                 )
 
             # 8. Extract diff from container

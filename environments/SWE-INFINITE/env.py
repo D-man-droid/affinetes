@@ -840,7 +840,10 @@ bash /workspace/entryscript.sh
                 error_msg = agent_result.error.lower()
                 if "timeout" in error_msg or "timed out" in error_msg:
                     error_type = "agent_timeout"
-                elif any(kw in error_msg for kw in ("api", "authentication", "connection", "network")):
+                elif error_msg.startswith("api_error") or any(kw in error_msg for kw in (
+                    "api", "authentication", "connection", "network",
+                    "404", "401", "403", "no matching chute", "reconnecting",
+                )):
                     error_type = "api_error"
                 elif "docker" in error_msg or "container" in error_msg:
                     error_type = "docker_error"
