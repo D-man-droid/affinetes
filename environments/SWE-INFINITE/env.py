@@ -765,6 +765,7 @@ bash /workspace/entryscript.sh
         temperature: float = 0.0,
         seed: Optional[int] = None,
         agent: str = "",
+        max_iterations: int = 100,
     ) -> Dict[str, Any]:
         """Evaluate an agent on a real PR task.
 
@@ -777,6 +778,7 @@ bash /workspace/entryscript.sh
             temperature: Model temperature
             seed: Random seed for LLM inference
             agent: Agent type — "miniswe" or "codex". Empty = auto-select from task metadata.
+            max_iterations: Max agent iterations (miniswe only)
         """
         start = time.time()
 
@@ -813,6 +815,7 @@ bash /workspace/entryscript.sh
             config = MiniSWEConfig(
                 model=model, api_base=base_url, api_key=eval_api_key,
                 temperature=temperature, timeout=timeout, seed=seed,
+                max_iterations=max_iterations,
             )
             agent_obj = MiniSWEAgent(config)
 
