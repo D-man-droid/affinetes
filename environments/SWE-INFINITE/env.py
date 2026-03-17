@@ -382,34 +382,9 @@ bash /workspace/entryscript.sh
                     if total > 0 and failures == 0 and errors == 0:
                         passed_tests = all_required.copy()
 
-            def _match_tests(required: set, actual: set) -> set:
-                """Match required test IDs against actual parsed test IDs.
-
-                Tries exact match first, then falls back to suffix matching
-                (handles Jest format mismatch where fail_to_pass has just
-                the test title but parser produces file_path::fullName).
-                """
-                matched = required & actual
-                unmatched = required - matched
-                if not unmatched:
-                    return matched
-                for req in unmatched:
-                    clean_req = req.lstrip(":")
-                    for act in actual:
-                        if "::" in act:
-                            act_name = act.split("::", 1)[1]
-                        else:
-                            act_name = act
-                        if act_name == clean_req or act_name.endswith(clean_req):
-                            matched.add(req)
-                            break
-                return matched
-
-            f2p_matched = _match_tests(f2p, passed_tests)
-            f2p_passed = len(f2p_matched)
-            all_matched = _match_tests(all_required, passed_tests)
-            all_passed_count = len(all_matched)
-            all_pass = len(all_matched) == len(all_required)
+            f2p_passed = len(f2p & passed_tests)
+            all_passed_count = len(all_required & passed_tests)
+            all_pass = all_required <= passed_tests
 
             test_stats = {
                 "f2p_result": f"{f2p_passed}/{len(f2p)}",
