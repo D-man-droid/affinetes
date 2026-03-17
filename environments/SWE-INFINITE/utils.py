@@ -64,7 +64,7 @@ _PYTEST_RE = re.compile(r"^([\w/.\-]+(?:::\w[\w\[\].\-]*)+)\s+(PASSED|FAILED|ERR
 _CARGO_RE = re.compile(r"^test\s+([\w:]+)\s+\.\.\.\s+(ok|FAILED|ignored)")
 
 # Minitest verbose output line format
-_MINITEST_RE = re.compile(r"^(.+?#\w+)\s*=.*=\s*([.FES])")
+_MINITEST_RE = re.compile(r"^(.+?)\s+=\s+[\d.]+\s+s\s+=\s+([.FES])\s*$")
 
 
 def parse_test_output(
@@ -139,7 +139,7 @@ def _parse_jest(stdout: str) -> tuple[list[str], list[str]]:
         file_path = suite.get("testFilePath", "")
         if file_path.startswith("/app/"):
             file_path = file_path[len("/app/"):]
-        for t in suite.get("testResults", []):
+        for t in suite.get("assertionResults") or suite.get("testResults", []):
             full_name = t.get("fullName") or t.get("title", "")
             test_id = f"{file_path}::{full_name}"
             status = t.get("status", "")
