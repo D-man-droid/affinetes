@@ -62,16 +62,12 @@ _EPOCH_SALT = os.getenv("TRANSPORT_SALT", f"{_DAILY_SALT}_{_PROCESS_SALT}")
 
 # Cache size from env var (default 512MB, replaces maxsize * 4KB estimate)
 try:
-    _CACHE_SIZE_MB = int(os.getenv("QQR_CACHE_SIZE_MB", "2048"))
+    _CACHE_SIZE_MB = int(os.getenv("QQR_CACHE_SIZE_MB", "4096"))
 except (ValueError, TypeError):
-    _CACHE_SIZE_MB = 2048
+    _CACHE_SIZE_MB = 4096
 
 
-def _amap_dynamic_ttl() -> int:
-    """Compute seconds until midnight — called per cache entry, not per server."""
-    now = int(time.time())
-    day_end = (now // 86400 + 1) * 86400
-    return max(3600, day_end - now)
+_CACHE_TTL = 172800  # 48 hours — shared by AMap and Transport
 
 
 def _round_coord_string(coord_str: str) -> str:
@@ -139,7 +135,7 @@ def mcp_server_config_fn() -> list:
         client_session_timeout_seconds=60,
         max_retry_attempts=3,
         blocklist=[],
-        cache_ttl=_amap_dynamic_ttl,  # Dynamic: per-entry seconds-until-midnight
+        cache_ttl=_CACHE_TTL,
         cache_maxsize=32768,
         cache_size_limit_mb=_CACHE_SIZE_MB,
         concurrency_limit=16,
@@ -165,7 +161,7 @@ def mcp_server_config_fn() -> list:
         client_session_timeout_seconds=120,
         max_retry_attempts=3,
         blocklist=[],
-        cache_ttl=172800,  # 48 hours
+        cache_ttl=_CACHE_TTL,
         cache_maxsize=32768,
         cache_size_limit_mb=_CACHE_SIZE_MB,
         concurrency_limit=4,
