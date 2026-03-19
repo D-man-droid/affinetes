@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import os
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import diskcache
 from agents.mcp import MCPServer, MCPUtil
@@ -67,14 +67,23 @@ class MCPServerCacheableMixin:
     - Local persistence (survives restarts)
     - Multi-process sharing (SQLite-based)
     - TTL expiration support
+
+    Features:
+    - cache_key_salt: prefix for cache keys (e.g., epoch salt for anti-memorization)
+    - key_normalizer: callback to normalize arguments before keying (e.g., round coordinates)
+    - cache_ttl: fixed int OR callable returning int (for dynamic per-entry TTL)
+    - Cache hit/miss metrics via get_cache_stats()
     """
 
     def __init__(
         self,
         blocklist: set = None,
-        cache_ttl: int = 600,
+        cache_ttl: Union[int, Callable[[], int]] = 600,
         cache_maxsize: int = 8192,
         concurrency_limit: int = 64,
+        cache_key_salt: str = "",
+        key_normalizer: Optional[Callable[[str, dict], dict]] = None,
+        cache_size_limit_mb: Optional[int] = None,
         *args,
         **kwargs,
     ):
@@ -84,16 +93,28 @@ class MCPServerCacheableMixin:
         server_name = getattr(self, 'name', 'default')
         cache_path = os.path.join(CACHE_DIR, server_name)
 
+        # Size limit: explicit MB override > maxsize * 4KB estimate
+        if cache_size_limit_mb is not None:
+            size_limit = cache_size_limit_mb * 1024 * 1024
+        else:
+            size_limit = cache_maxsize * 4096
+
         # Use diskcache for multi-process sharing
         self._tool_cache = diskcache.Cache(
             cache_path,
-            size_limit=cache_maxsize * 4096,  # Convert to bytes (assuming 4KB per entry)
+            size_limit=size_limit,
             eviction_policy='least-recently-used',
         )
         self._cache_ttl = cache_ttl
         self._cache_blocklist = blocklist or set()
+        self._cache_key_salt = cache_key_salt
+        self._key_normalizer = key_normalizer
         self.concurrency_limit = concurrency_limit
         self._semaphore = None
+
+        # Cache metrics
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -101,14 +122,58 @@ class MCPServerCacheableMixin:
             self._semaphore = asyncio.Semaphore(self.concurrency_limit)
         return self._semaphore
 
+    def _get_ttl(self) -> int:
+        """Get current TTL value. Supports both fixed int and callable."""
+        if callable(self._cache_ttl):
+            return self._cache_ttl()
+        return self._cache_ttl
+
     def _make_cache_key(self, tool_name: str, arguments: dict) -> str:
+        # Apply normalizer if configured (with fallback on error)
+        if self._key_normalizer and arguments:
+            try:
+                arguments = self._key_normalizer(tool_name, arguments)
+            except Exception:
+                pass  # Use original arguments on normalizer failure
+
         if arguments is None:
-            return tool_name
-        args_str = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
-        full_key = f"{tool_name}:{args_str}"
-        if len(full_key) > 1024:
-            return hashlib.md5(full_key.encode("utf-8")).hexdigest()
-        return full_key
+            key = tool_name
+        else:
+            args_str = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+            key = f"{tool_name}:{args_str}"
+
+        # Include salt prefix for cache isolation across epochs
+        if self._cache_key_salt:
+            key = f"{self._cache_key_salt}:{key}"
+
+        if len(key) > 1024:
+            return hashlib.md5(key.encode("utf-8")).hexdigest()
+        return key
+
+    @staticmethod
+    def _serialize_result(result: CallToolResult) -> str:
+        """Serialize CallToolResult to JSON string for cache storage.
+
+        We do NOT pickle CallToolResult directly because:
+        - Pydantic v2 models have unstable pickle behavior across versions
+        - Production evidence: access_count=0 on all 4,336 cached entries
+          proves pickle.loads() silently failed on every cache.get()
+        - JSON is version-independent and human-debuggable
+        """
+        items = []
+        for item in result.content:
+            items.append(item.model_dump(mode="json"))
+        return json.dumps({"content": items, "isError": result.isError}, ensure_ascii=False)
+
+    @staticmethod
+    def _deserialize_result(data: str) -> CallToolResult:
+        """Deserialize JSON string back to CallToolResult."""
+        from mcp.types import TextContent
+        parsed = json.loads(data)
+        content = []
+        for item in parsed["content"]:
+            content.append(TextContent(**item))
+        return CallToolResult(content=content, isError=parsed["isError"])
 
     async def call_tool(
         self, tool_name: str, arguments: Dict[str, Any]
@@ -119,23 +184,52 @@ class MCPServerCacheableMixin:
 
         cache_key = self._make_cache_key(tool_name, arguments)
 
-        # diskcache.get returns None if not found, use default param to distinguish
-        cached_result = self._tool_cache.get(cache_key, default=None)
-        if cached_result is not None:
-            return cached_result
+        # Read from cache: stored as JSON string (not pickled Pydantic object)
+        cached_json = self._tool_cache.get(cache_key, default=None)
+        if cached_json is not None:
+            try:
+                self._cache_hits += 1
+                return self._deserialize_result(cached_json)
+            except Exception:
+                # Corrupted entry — treat as miss, will be overwritten
+                self._cache_hits -= 1
+
+        self._cache_misses += 1
 
         async with self.semaphore:
             # Double-check after acquiring semaphore
-            cached_result = self._tool_cache.get(cache_key, default=None)
-            if cached_result is not None:
-                return cached_result
+            cached_json = self._tool_cache.get(cache_key, default=None)
+            if cached_json is not None:
+                try:
+                    self._cache_hits += 1
+                    return self._deserialize_result(cached_json)
+                except Exception:
+                    self._cache_hits -= 1
 
             result = await super().call_tool(tool_name, arguments)
             if not result.isError:
-                # Set TTL using expire parameter
-                self._tool_cache.set(cache_key, result, expire=self._cache_ttl)
+                try:
+                    serialized = self._serialize_result(result)
+                    self._tool_cache.set(cache_key, serialized, expire=self._get_ttl())
+                except Exception as e:
+                    logger.warning("Cache write failed for %s: %s", tool_name, e)
 
         return result
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Return cache hit/miss statistics for monitoring."""
+        total = self._cache_hits + self._cache_misses
+        try:
+            disk_bytes = self._tool_cache.volume()
+        except Exception:
+            disk_bytes = 0
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "hit_rate": round(self._cache_hits / total, 4) if total > 0 else 0.0,
+            "total_calls": total,
+            "disk_size_mb": round(disk_bytes / 1024 / 1024, 1),
+        }
 
     async def cleanup(self):
         await super().cleanup()
@@ -249,10 +343,7 @@ class MCPState(metaclass=SingletonMeta):
         except (ConnectionError, BrokenPipeError, OSError) as e:
             if allow_retry:
                 logger.warning("MCP subprocess connection lost (%s), resetting and retrying", e)
-                async with self._mcp_lock:
-                    self._mcp_servers = None
-                    self.tools = []
-                    self.tool_to_server = {}
+                await self._cleanup_and_reset()
                 return await self._call_tool_inner(tool_call, allow_retry=False)
             tool_content = f"[Error] MCP connection failed after retry: {e}"
         except Exception as e:
@@ -260,10 +351,7 @@ class MCPState(metaclass=SingletonMeta):
             err_msg = str(e).lower()
             if allow_retry and any(kw in err_msg for kw in ("broken pipe", "connection", "eof", "transport")):
                 logger.warning("MCP subprocess likely crashed (%s), resetting and retrying", e)
-                async with self._mcp_lock:
-                    self._mcp_servers = None
-                    self.tools = []
-                    self.tool_to_server = {}
+                await self._cleanup_and_reset()
                 return await self._call_tool_inner(tool_call, allow_retry=False)
             tool_content = f"[Error] Tool execution failed: {e}"
 
@@ -272,3 +360,17 @@ class MCPState(metaclass=SingletonMeta):
             "content": tool_content,
             "tool_call_id": tool_call_id,
         }
+
+    async def _cleanup_and_reset(self):
+        """Cleanup old servers before resetting state (prevents resource leaks)."""
+        async with self._mcp_lock:
+            if self._mcp_servers:
+                for server in self._mcp_servers:
+                    try:
+                        await asyncio.wait_for(server.cleanup(), timeout=5)
+                    except BaseException as e:
+                        logger.warning("Cleanup during reset failed for %s: %s",
+                                       getattr(server, 'name', '?'), e)
+            self._mcp_servers = None
+            self.tools = []
+            self.tool_to_server = {}

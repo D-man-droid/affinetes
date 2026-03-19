@@ -60,6 +60,61 @@ _DAILY_SALT = str(int(time.time()) // 86400)
 _PROCESS_SALT = uuid.uuid4().hex[:8]
 _EPOCH_SALT = os.getenv("TRANSPORT_SALT", f"{_DAILY_SALT}_{_PROCESS_SALT}")
 
+# Cache size from env var (default 512MB, replaces maxsize * 4KB estimate)
+try:
+    _CACHE_SIZE_MB = int(os.getenv("QQR_CACHE_SIZE_MB", "2048"))
+except (ValueError, TypeError):
+    _CACHE_SIZE_MB = 2048
+
+
+def _amap_dynamic_ttl() -> int:
+    """Compute seconds until midnight — called per cache entry, not per server."""
+    now = int(time.time())
+    day_end = (now // 86400 + 1) * 86400
+    return max(3600, day_end - now)
+
+
+def _round_coord_string(coord_str: str) -> str:
+    """Round coordinate string to 4 decimal places (~11m precision)."""
+    coord_str = coord_str.replace('\uff0c', ',').replace(' ', '')
+    parts = coord_str.split(',')
+    if len(parts) == 2:
+        try:
+            return f"{round(float(parts[0]), 4)},{round(float(parts[1]), 4)}"
+        except (ValueError, OverflowError):
+            pass
+    return coord_str
+
+
+def _normalize_amap_args(tool_name: str, arguments: dict) -> dict:
+    """Normalize AMap tool arguments for better cache hit rate.
+
+    - direction/around_search: round coordinates to 4 decimal places
+    - All tools: strip whitespace from string arguments
+    """
+    if not arguments:
+        return arguments
+
+    args = dict(arguments)  # Shallow copy — tool args are flat strings
+
+    # Round coordinates for coordinate-based tools
+    if tool_name in ("direction", "around_search"):
+        for coord_key in ("origin", "destination", "location"):
+            if coord_key in args and isinstance(args[coord_key], str):
+                args[coord_key] = _round_coord_string(args[coord_key])
+        # Normalize waypoints (semicolon-separated coordinate pairs)
+        if "waypoints" in args and isinstance(args["waypoints"], str) and args["waypoints"]:
+            parts = args["waypoints"].split(";")
+            args["waypoints"] = ";".join(_round_coord_string(p) for p in parts)
+
+    # Strip whitespace from all string values
+    for k, v in args.items():
+        if isinstance(v, str):
+            args[k] = v.strip()
+
+    return args
+
+
 def mcp_server_config_fn() -> list:
     """
     MCP server configuration function.
@@ -76,12 +131,6 @@ def mcp_server_config_fn() -> list:
             "PYTHONPATH": PYTHONPATH or "",
         },
     )
-    # AMap cache TTL aligned to daily salt rotation (P4).
-    # Ensures AMap data stays stable within the same scoring day.
-    _SECONDS_PER_DAY = 86400
-    _now = int(time.time())
-    _epoch_start = _now // _SECONDS_PER_DAY * _SECONDS_PER_DAY
-    _amap_cache_ttl = max(3600, _epoch_start + _SECONDS_PER_DAY - _now)
 
     amap_server = MCPServerStdioCacheable(
         name="AMap",
@@ -90,9 +139,11 @@ def mcp_server_config_fn() -> list:
         client_session_timeout_seconds=60,
         max_retry_attempts=3,
         blocklist=[],
-        cache_ttl=_amap_cache_ttl,
+        cache_ttl=_amap_dynamic_ttl,  # Dynamic: per-entry seconds-until-midnight
         cache_maxsize=32768,
+        cache_size_limit_mb=_CACHE_SIZE_MB,
         concurrency_limit=16,
+        key_normalizer=_normalize_amap_args,
     )
 
     # Transport server configuration
@@ -115,8 +166,10 @@ def mcp_server_config_fn() -> list:
         max_retry_attempts=3,
         blocklist=[],
         cache_ttl=172800,  # 48 hours
-        cache_maxsize=32768,  # 4x expanded
+        cache_maxsize=32768,
+        cache_size_limit_mb=_CACHE_SIZE_MB,
         concurrency_limit=4,
+        cache_key_salt=epoch_salt,  # Include salt so cache invalidates on salt rotation
     )
 
     return [amap_server, transport_server]
@@ -1005,11 +1058,17 @@ class Actor:
                         break
         except OSError:
             pass
-        return {
+        stats = {
             "rss_mb": round(rss_kb / 1024, 1),
             "episodes_active": len(self._episodes),
             "eval_count": self._eval_count,
         }
+        # Include cache stats if MCP servers are initialized
+        if self._mcp_state and self._mcp_state._mcp_servers:
+            for server in self._mcp_state._mcp_servers:
+                if hasattr(server, 'get_cache_stats'):
+                    stats[f"cache_{server.name}"] = server.get_cache_stats()
+        return stats
 
     async def cleanup(self):
         """Clean up resources — close MCP servers, HTTP client, and release memory."""
