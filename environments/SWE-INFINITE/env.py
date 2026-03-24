@@ -180,6 +180,73 @@ class InfiniteActor:
         except Exception as e:
             print(f"[SWE-INFINITE] Warning: Failed to cleanup stale containers: {e}")
 
+    def _cleanup_docker_resources(self, current_image: str = None, max_images: int = 10) -> None:
+        """Clean up Docker resources to free disk space.
+
+        Args:
+            current_image: The image used in current task (will be kept)
+            max_images: Maximum number of cached images to keep
+        """
+        try:
+            # Remove stopped containers
+            subprocess.run(
+                ["docker", "container", "prune", "-f"],
+                capture_output=True, timeout=60,
+            )
+            # Remove dangling images (untagged)
+            subprocess.run(
+                ["docker", "image", "prune", "-f"],
+                capture_output=True, timeout=60,
+            )
+
+            # Clean up old swe-bench / sweap images to prevent disk exhaustion
+            try:
+                result = subprocess.run(
+                    ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    images = []
+                    for line in result.stdout.strip().split('\n'):
+                        if not line or '\t' not in line:
+                            continue
+                        image, created = line.split('\t', 1)
+                        # Only manage images pulled for tasks
+                        if "swe_infinite_images" in image:
+                            images.append((image, created))
+
+                    # Sort by creation time (newest first)
+                    images.sort(key=lambda x: x[1], reverse=True)
+
+                    images_to_remove = []
+                    kept = 0
+                    for image, _ in images:
+                        if current_image and image == current_image:
+                            continue  # Always keep current image
+                        if kept < max_images:
+                            kept += 1
+                        else:
+                            images_to_remove.append(image)
+
+                    for image in images_to_remove:
+                        subprocess.run(
+                            ["docker", "rmi", "-f", image],
+                            capture_output=True, timeout=60,
+                        )
+
+                    if images_to_remove:
+                        print(f"[SWE-INFINITE] Cleaned up {len(images_to_remove)} old images")
+            except Exception as e:
+                print(f"[SWE-INFINITE] Warning: Failed to clean images: {e}")
+
+            # Clean up Docker build cache older than 24h
+            subprocess.run(
+                ["docker", "builder", "prune", "-f", "--filter", "until=24h"],
+                capture_output=True, timeout=60,
+            )
+        except Exception as e:
+            print(f"[SWE-INFINITE] Cleanup warning: {e}")
+
     def _start_periodic_cleanup(self, interval_hours: float = 6):
         """Start background thread for periodic resource cleanup."""
         import threading
@@ -189,6 +256,7 @@ class InfiniteActor:
                 time.sleep(interval_hours * 3600)
                 try:
                     self._cleanup_stale_containers()
+                    self._cleanup_docker_resources()
                 except Exception as e:
                     print(f"[SWE-INFINITE] Periodic cleanup error: {e}")
 
@@ -863,6 +931,9 @@ bash /workspace/entryscript.sh
             score = 0.0
         else:
             score, test_stats = self._verify(task, fix_patch)
+
+        # Clean up docker resources after each evaluation
+        self._cleanup_docker_resources(current_image=docker_image)
 
         return {
             "task_name": "swe-infinite",
