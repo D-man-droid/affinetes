@@ -918,11 +918,15 @@ bash /workspace/entryscript.sh
                     "404", "401", "403", "no matching chute", "reconnecting",
                 )):
                     error_type = "api_error"
-                elif "docker" in error_msg or "container" in error_msg:
+                elif any(kw in error_msg for kw in (
+                    "docker", "container", "no space left", "pull image", "disk quota",
+                )):
                     error_type = "docker_error"
                 else:
                     error_type = "agent_error"
                 if error_type in ("api_error", "docker_error", "agent_timeout"):
+                    if "no space left" in error_msg or "disk quota" in error_msg:
+                        self._cleanup_docker_resources()
                     raise RuntimeError(f"{error_type}: {agent_result.error}")
                 test_stats = {"error": agent_result.error, "error_type": error_type}
             else:
