@@ -95,11 +95,19 @@ def _bucket_radius(radius) -> int:
     return 5000
 
 
+def _normalize_city(name: str) -> str:
+    """Normalize city name: '杭州市' → '杭州', '乌鲁木齐市' → '乌鲁木齐'."""
+    if len(name) > 2 and name[-1] in ("市", "县", "区"):
+        return name[:-1]
+    return name
+
+
 def _normalize_amap_args(tool_name: str, arguments: dict) -> dict:
     """Normalize AMap tool arguments for better cache hit rate.
 
     - direction: round coordinates to 3 decimal places (~111m)
     - around_search: round coordinates to 3 decimal places + bucket radius
+    - weather/poi_search/around_search: normalize city names ('杭州市' → '杭州')
     - All tools: strip whitespace from string arguments
     """
     if not arguments:
@@ -120,6 +128,11 @@ def _normalize_amap_args(tool_name: str, arguments: dict) -> dict:
             args["location"] = _round_coord(args["location"], 3)
         if "radius" in args:
             args["radius"] = _bucket_radius(args["radius"])
+
+    # Normalize city name fields
+    for city_key in ("city", "region"):
+        if city_key in args and isinstance(args[city_key], str):
+            args[city_key] = _normalize_city(args[city_key].strip())
 
     # Strip whitespace from all string values
     for k, v in args.items():
