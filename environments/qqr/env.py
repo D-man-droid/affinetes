@@ -598,6 +598,30 @@ class Actor:
                     "result": self._truncate_tool_result(result_content, max_chars=3000),
                 })
 
+                # Check for env errors after EACH tool call — don't waste
+                # remaining calls in this batch if API is already broken
+                if any(p in result_content for p in self._ENV_ERROR_PATTERNS):
+                    break
+
+            # Check for environment-side errors immediately after tool execution.
+            # If API quota is exhausted, stop the evaluation now instead of
+            # letting the model continue with broken tool data for more steps.
+            env_error = self._detect_env_error(ep.tool_trace)
+            if env_error:
+                ep.done = True
+                ep.final_score = 0.0
+                ep.score_breakdown = {"error": env_error}
+                return OpenEnvResponse(
+                    observation="",
+                    reward=0.0,
+                    done=True,
+                    episode_id=episode_id,
+                    info={
+                        "score": 0.0,
+                        "score_breakdown": ep.score_breakdown,
+                    },
+                )
+
             # Standard OpenAI tool role: one message per tool result,
             # keyed by tool_call_id so the model can match request → response
             for r in tool_results:
@@ -776,6 +800,10 @@ class Actor:
                             episode_id=episode_id,
                             tool_calls=tool_calls,
                         )
+                        # step() may terminate early on env errors (API quota etc)
+                        if step_resp.done:
+                            logger.debug("step() returned done=True, stopping evaluation")
+                            break
                     else:
                         # Model stopped calling tools — this is its natural answer
                         final_content = content
@@ -809,7 +837,9 @@ class Actor:
                                     total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
                                 # If model wants to call tools, let it do one round
                                 if tool_calls and ep.current_step < MAX_TOOL_STEPS:
-                                    await self.step(action=final_content, episode_id=episode_id, tool_calls=tool_calls)
+                                    retry_step = await self.step(action=final_content, episode_id=episode_id, tool_calls=tool_calls)
+                                    if retry_step.done:
+                                        break
                                     final_content = None  # Need another response
                                     continue
                                 break
@@ -989,6 +1019,8 @@ class Actor:
         "QPS_OVER_LIMIT",
         "USERBAND_BINDbindedkeysoverrun",
         "CUOTA_PLAN_RUN_OUT",
+        "INVALID_USER_KEY",
+        "INVALID_USER_SCODE",
         "tool_call_timeout",
     ]
 
