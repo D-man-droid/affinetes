@@ -753,7 +753,15 @@ class Actor:
             episode_id = reset_resp.episode_id
             ep = self._episodes[episode_id]
 
-            total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+            total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+            def _accum_usage(usage: dict):
+                if usage:
+                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                    total_usage["total_tokens"] += usage.get("total_tokens",
+                        usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+
             final_content = None
             llm_failed = False
 
@@ -782,9 +790,7 @@ class Actor:
                     usage = response.get("usage", {})
                     logger.debug("LLM response: content_len=%d, tool_calls=%d", len(content), len(tool_calls) if tool_calls else 0)
 
-                    if usage:
-                        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                    _accum_usage(usage)
 
                     if tool_calls:
                         logger.debug("tool_calls sample: %s", tool_calls[0])
@@ -831,10 +837,7 @@ class Actor:
                             if response:
                                 final_content = response.get("content") or ""
                                 tool_calls = response.get("tool_calls")
-                                usage = response.get("usage", {})
-                                if usage:
-                                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                                _accum_usage(response.get("usage", {}))
                                 # If model wants to call tools, let it do one round
                                 if tool_calls and ep.current_step < MAX_TOOL_STEPS:
                                     retry_step = await self.step(action=final_content, episode_id=episode_id, tool_calls=tool_calls)
@@ -863,10 +866,7 @@ class Actor:
                         )
                         if response and response.get("content"):
                             final_content = response.get("content")
-                            usage = response.get("usage", {})
-                            if usage:
-                                total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                                total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                            _accum_usage(response.get("usage", {}))
                             logger.debug("Got final answer via explicit request: len=%d", len(final_content))
                         else:
                             logger.debug("Final answer request also failed")
