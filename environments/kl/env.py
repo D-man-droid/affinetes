@@ -1,0 +1,279 @@
+"""KL Divergence Environment.
+
+Computes KL divergence between a student model and pre-generated teacher rollouts.
+
+Flow:
+    1. Load teacher rollout from R2 by task_id (same pattern as SWE-INFINITE)
+       Rollout contains full_logprobs: {full, token_ids, logprobs}
+    2. Student forward pass: /v1/completions with echo=True + logprobs=1
+    3. Align by token position, compute KL on assistant tokens (non-None logprobs)
+
+Task ID:
+    Plain integer, maps to a teacher rollout file in R2:
+      {R2_BASE_URL}/{R2_PREFIX}/task_{task_id:011d}.json
+
+    The rollout JSON must contain a "full_logprobs" key with:
+      full: str           - formatted conversation text
+      token_ids: [int]    - token positions (or offsets)
+      logprobs: [float|None] - None = masked, float = assistant token logprob
+"""
+
+import math
+import os
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+
+import httpx
+
+
+class LocalCache:
+    """Local filesystem cache for teacher rollouts."""
+
+    def __init__(self, cache_dir: str = "/tmp/kl-cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, task_id: int) -> Path:
+        return self.cache_dir / f"task_{task_id:011d}.json"
+
+    def load(self, task_id: int) -> Optional[Dict]:
+        p = self._path(task_id)
+        if p.exists():
+            with open(p) as f:
+                return json.load(f)
+        return None
+
+    def save(self, task_id: int, data: Dict) -> None:
+        with open(self._path(task_id), "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+
+
+class R2Cache:
+    """Read-only R2 public HTTP cache for teacher rollouts."""
+
+    def __init__(self, base_url: str, prefix: str):
+        self.base_url = base_url.rstrip("/")
+        self.prefix = prefix.rstrip("/")
+
+    def _url(self, task_id: int) -> str:
+        filename = f"task_{task_id:011d}.json"
+        return f"{self.base_url}/{self.prefix}/{filename}"
+
+    def load(self, task_id: int) -> Optional[Dict]:
+        url = self._url(task_id)
+        try:
+            req = Request(url, headers={"User-Agent": "kl-env/1.0"})
+            with urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except HTTPError as e:
+            if e.code != 404:
+                print(f"[KL] R2 error for {task_id}: {e.code}")
+            return None
+        except (URLError, TimeoutError) as e:
+            print(f"[KL] R2 fetch error for {task_id}: {e}")
+            return None
+
+
+class Actor:
+    """Computes KL divergence between student model and teacher rollouts."""
+
+    def __init__(self):
+        r2_base = os.getenv("KL_R2_BASE_URL", "https://pub-placeholder.r2.dev")
+        r2_prefix = os.getenv("KL_R2_PREFIX", "teacher_rollouts")
+        cache_dir = os.getenv("KL_CACHE_DIR", "/tmp/kl-cache")
+
+        self._local = LocalCache(cache_dir)
+        self._r2 = R2Cache(r2_base, r2_prefix)
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0),
+            verify=False,
+        )
+
+    def _load_rollout(self, task_id: int) -> Optional[Dict]:
+        """Load teacher rollout: L1 local -> L2 R2."""
+        data = self._local.load(task_id)
+        if data is not None:
+            return data
+        data = self._r2.load(task_id)
+        if data is not None:
+            self._local.save(task_id, data)
+            return data
+        return None
+
+    async def _student_forward_pass(
+        self,
+        prompt: str,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: float,
+    ) -> Optional[Dict]:
+        """Student forward pass with echo=True to get logprobs for all tokens.
+
+        Returns the logprobs dict from the API response, or None on failure.
+        """
+        resp = await self._http.post(
+            f"{base_url.rstrip('/')}/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": 1,
+                "logprobs": 1,
+                "echo": True,
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        return choices[0].get("logprobs")
+
+    def _compute_kl(
+        self,
+        teacher_logprobs: List,
+        student_lp_dict: Dict,
+    ) -> Dict[str, Any]:
+        """Compute KL divergence between teacher and student logprobs.
+
+        Both teacher and student have logprobs for the same token sequence.
+        Teacher logprobs[i] is None for non-assistant tokens.
+        Student logprobs come from echo=True (covers all tokens).
+
+        We align by position: same tokenizer -> same token sequence.
+        """
+        student_token_logprobs = student_lp_dict.get("token_logprobs", [])
+
+        total_kl = 0.0
+        matched = 0
+        total_teacher = sum(1 for lp in teacher_logprobs if lp is not None)
+
+        for i, t_lp in enumerate(teacher_logprobs):
+            if t_lp is None:
+                continue
+            if i >= len(student_token_logprobs):
+                break
+            s_lp = student_token_logprobs[i]
+            if s_lp is None:
+                continue
+            # Per-token KL contribution: teacher_lp - student_lp
+            total_kl += t_lp - s_lp
+            matched += 1
+
+        avg_kl = total_kl / matched if matched > 0 else 0.0
+
+        return {
+            "kl": avg_kl,
+            "total_kl": total_kl,
+            "matched_tokens": matched,
+            "total_teacher_tokens": total_teacher,
+            "match_rate": matched / total_teacher if total_teacher > 0 else 0.0,
+        }
+
+    async def evaluate(
+        self,
+        task_id: int,
+        model: str = "deepseek-ai/DeepSeek-V3",
+        base_url: str = "https://llm.chutes.ai/v1",
+        api_key: str = None,
+        seed: int = None,
+        timeout: float = 300.0,
+        temperature: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Evaluate KL divergence between student and teacher.
+
+        Args:
+            task_id: Maps to teacher rollout in R2.
+            model: Student model name.
+            base_url: Student model API endpoint.
+            api_key: API key.
+            seed: Unused (framework compat).
+            timeout: Request timeout.
+            temperature: Unused (forward pass only).
+        """
+        api_key = api_key or os.getenv("CHUTES_API_KEY")
+        start = time.time()
+
+        # Load teacher rollout
+        rollout = self._load_rollout(task_id)
+        if rollout is None:
+            return {
+                "task_name": "kl",
+                "score": 0.0,
+                "success": False,
+                "time_taken": time.time() - start,
+                "error": f"Teacher rollout not found: {task_id}",
+                "error_type": "rollout_not_found",
+                "extra": {"task_id": task_id},
+            }
+
+        teacher_lp = rollout.get("full_logprobs")
+        if not teacher_lp or not teacher_lp.get("full"):
+            return {
+                "task_name": "kl",
+                "score": 0.0,
+                "success": False,
+                "time_taken": time.time() - start,
+                "error": "Teacher rollout has no full_logprobs",
+                "extra": {"task_id": task_id},
+            }
+
+        full_text = teacher_lp["full"]
+        teacher_logprobs = teacher_lp["logprobs"]
+
+        # Student forward pass
+        error = None
+        kl_result = None
+        try:
+            student_lp = await self._student_forward_pass(
+                prompt=full_text,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            )
+
+            if student_lp is None:
+                error = "Student forward pass failed"
+            else:
+                kl_result = self._compute_kl(teacher_logprobs, student_lp)
+        except Exception as e:
+            import traceback
+            error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+
+        # Score: exp(-|kl|), perfect match = 1.0
+        score = 0.0
+        if kl_result and kl_result["matched_tokens"] > 0:
+            score = math.exp(-abs(kl_result["kl"]))
+
+        result = {
+            "task_name": "kl",
+            "score": score,
+            "success": error is None and kl_result is not None,
+            "time_taken": time.time() - start,
+            "extra": {
+                "task_id": task_id,
+                "kl": kl_result,
+                "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp is not None),
+                "model": model,
+            },
+        }
+
+        if error:
+            result["error"] = error
+
+        return result
