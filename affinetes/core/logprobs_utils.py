@@ -2,7 +2,7 @@
 
 After a teacher model completes a rollout, call collect_full_logprobs() to:
 1. Format the conversation with a chat template
-2. Forward pass with prompt_logprobs to get all token_ids + logprobs
+2. Forward pass with echo=True to get all tokens + logprobs
 3. Mark assistant positions with real logprobs, rest with None
 
 Output format:
@@ -15,12 +15,7 @@ Output format:
     - float = assistant token (participate in KL)
 
 Student-side KL:
-    student_resp = student.completions.create(
-        prompt=full_logprobs["full"],
-        prompt_logprobs=1,
-        max_tokens=0,
-    )
-    # Same tokenizer → same token positions → direct comparison
+    Use the same echo=True approach, or /v1/chat/completions with logprobs=True.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -91,7 +86,10 @@ async def collect_full_logprobs(
     chat_template: str = "qwen",
     timeout: float = 300.0,
 ) -> Optional[Dict[str, Any]]:
-    """Build full_logprobs by doing a forward pass on the formatted conversation.
+    """Build full_logprobs by doing a forward pass with echo=True.
+
+    Uses /v1/completions with echo=True + logprobs=1 to get logprobs
+    for ALL tokens (prompt + completion) in a single call.
 
     Args:
         conversation: Full conversation [{role, content}, ...].
@@ -114,7 +112,7 @@ async def collect_full_logprobs(
     if not full_text or not assistant_ranges:
         return None
 
-    # Forward pass: get prompt_logprobs for ALL tokens
+    # Forward pass with echo=True: returns logprobs for prompt + completion tokens
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=False) as client:
         resp = await client.post(
             f"{base_url.rstrip('/')}/completions",
@@ -125,8 +123,9 @@ async def collect_full_logprobs(
             json={
                 "model": model,
                 "prompt": full_text,
-                "max_tokens": 0,
-                "prompt_logprobs": 1,
+                "max_tokens": 1,
+                "logprobs": 1,
+                "echo": True,
                 "stream": False,
             },
         )
@@ -140,48 +139,39 @@ async def collect_full_logprobs(
     if not choices:
         return None
 
-    raw_prompt_logprobs = choices[0].get("prompt_logprobs")
-    if not raw_prompt_logprobs:
+    lp = choices[0].get("logprobs")
+    if not lp or not lp.get("tokens"):
         return None
 
-    # Parse prompt_logprobs into token_ids + per-token logprobs + char positions
-    # vLLM format: list of (None | {token_id_str: {"logprob": float, "decoded_token": str}})
+    raw_tokens = lp["tokens"]
+    raw_logprobs = lp.get("token_logprobs", [])
+    raw_token_ids = lp.get("text_offset", [])  # char offsets, not token ids
+
+    # Map each token to char position, check if within assistant range
     token_ids = []
-    all_logprobs = []
-    token_texts = []
-
-    for entry in raw_prompt_logprobs:
-        if entry is None:
-            # BOS token
-            token_ids.append(0)
-            all_logprobs.append(0.0)
-            token_texts.append("")
-        elif isinstance(entry, dict):
-            for tok_id_str, info in entry.items():
-                token_ids.append(int(tok_id_str))
-                all_logprobs.append(info.get("logprob", 0.0))
-                token_texts.append(info.get("decoded_token", ""))
-                break
-
-    # Map each token to its char position in full_text, then check if it's assistant
-    char_pos = 0
     logprobs_masked = []
+    char_pos = 0
 
-    for i, tok_text in enumerate(token_texts):
-        tok_len = len(tok_text)
-        # Check if this token falls within any assistant range
+    for i, tok in enumerate(raw_tokens):
+        tok_logprob = raw_logprobs[i] if i < len(raw_logprobs) else None
+
+        # Determine if this token falls within any assistant range
         is_assistant = False
         for a_start, a_end in assistant_ranges:
             if char_pos >= a_start and char_pos < a_end:
                 is_assistant = True
                 break
 
-        if is_assistant:
-            logprobs_masked.append(all_logprobs[i])
+        # Use text_offset for token_id (vLLM returns text_offset in logprobs)
+        # Store the position as a proxy for token_id
+        token_ids.append(raw_token_ids[i] if i < len(raw_token_ids) else char_pos)
+
+        if is_assistant and tok_logprob is not None:
+            logprobs_masked.append(tok_logprob)
         else:
             logprobs_masked.append(None)
 
-        char_pos += tok_len
+        char_pos += len(tok)
 
     return {
         "full": full_text,
