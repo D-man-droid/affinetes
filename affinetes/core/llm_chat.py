@@ -325,7 +325,11 @@ async def _stream_chat(
 
     content = "".join(content_parts).strip() or None
     reasoning = "".join(reasoning_parts) or None
-    return ChatResult(content=content, reasoning=reasoning, usage=usage)
+    return ChatResult(
+        content=content,
+        reasoning=reasoning,
+        usage=usage,
+    )
 
 
 async def _non_stream_chat(
@@ -342,4 +346,9 @@ async def _non_stream_chat(
     msg = resp.choices[0].message
     content = msg.content.strip() if msg.content else None
     reasoning = getattr(msg, "reasoning_content", None)
-    return ChatResult(content=content, reasoning=reasoning, usage=usage)
+
+    return ChatResult(
+        content=content,
+        reasoning=reasoning,
+        usage=usage,
+    )
