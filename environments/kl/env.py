@@ -82,7 +82,7 @@ class Actor:
     """Computes KL divergence between student model and teacher rollouts."""
 
     def __init__(self):
-        r2_base = os.getenv("KL_R2_BASE_URL", "https://pub-placeholder.r2.dev")
+        r2_base = os.getenv("KL_R2_BASE_URL", "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev")
         r2_prefix = os.getenv("KL_R2_PREFIX", "teacher_rollouts")
         cache_dir = os.getenv("KL_CACHE_DIR", "/tmp/kl-cache")
 
