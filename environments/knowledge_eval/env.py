@@ -183,7 +183,7 @@ class Actor:
         temperature: float = 0.7,
         api_key: Optional[str] = None,
         seed: Optional[int] = None,
-        anti_contam: str = "shuffle",
+        anti_contam: str = "cross_pool",
         perturb_seed: Optional[int] = None,
         extra_distractors: int = 4,
         collect_logprobs: bool = False,
@@ -199,13 +199,17 @@ class Actor:
             model, base_url, timeout, temperature, api_key, seed:
                 Standard LLM call knobs. ``api_key`` falls back to the
                 instance value (CHUTES_API_KEY env at construction time).
-            anti_contam: Anti-contamination mode for MC tasks.
+            anti_contam: Anti-contamination mode for MC tasks. Default
+                is ``cross_pool``.
                 ``off`` keeps the original option order; ``shuffle``
                 deterministically reorders options; ``distractor_swap``
                 replaces incorrect options with same-category
-                distractors from other questions and then shuffles.
-                IFEval ignores this. HLE falls back to ``shuffle`` for
-                ``distractor_swap``.
+                distractors from other questions and then shuffles;
+                ``cross_pool`` keeps the original options and *extends*
+                them with K extra cross-question options (see
+                ``extra_distractors``) — this is the strongest defence
+                against answer-text memorisation. IFEval ignores this.
+                HLE's ``distractor_swap`` falls back to ``shuffle``.
             perturb_seed: Seed for the deterministic shuffle / swap.
                 Defaults to ``task_id`` so a bare ``task_id`` is fully
                 reproducible. Pass a different value to materialise an
@@ -391,7 +395,7 @@ class Actor:
         temperature: float = 0.7,
         api_key: Optional[str] = None,
         seed: Optional[int] = None,
-        anti_contam: str = "shuffle",
+        anti_contam: str = "cross_pool",
         perturb_seed: Optional[int] = None,
         extra_distractors: int = 4,
         collect_logprobs: bool = False,
