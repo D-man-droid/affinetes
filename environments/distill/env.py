@@ -213,7 +213,7 @@ class Actor:
         rollout = self._load_rollout(task_id)
         if rollout is None:
             return {
-                "task_name": "kl",
+                "task_name": "distill",
                 "score": 0.0,
                 "success": False,
                 "time_taken": time.time() - start,
@@ -225,7 +225,7 @@ class Actor:
         teacher_lp = rollout.get("full_logprobs")
         if not teacher_lp or not teacher_lp.get("full"):
             return {
-                "task_name": "kl",
+                "task_name": "distill",
                 "score": 0.0,
                 "success": False,
                 "time_taken": time.time() - start,
@@ -262,7 +262,7 @@ class Actor:
             score = math.exp(-abs(kl_result["kl"]))
 
         result = {
-            "task_name": "kl",
+            "task_name": "distill",
             "score": score,
             "success": error is None and kl_result is not None,
             "time_taken": time.time() - start,
