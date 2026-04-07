@@ -111,38 +111,98 @@ class Actor:
         base_url: str,
         api_key: str,
         timeout: float,
-    ) -> Optional[Dict]:
+    ) -> tuple:
         """Student forward pass with echo=True to get logprobs for all tokens.
 
-        Returns the logprobs dict from the API response, or None on failure.
+        Returns (logprobs_dict, error_info) where:
+          - On success: (logprobs_dict, None)
+          - On failure: (None, {"error_type": str, "message": str, "status": int|None})
+
+        Error types:
+          - rate_limit      : HTTP 429 (Chutes infra capacity / upstream rate limit)
+          - no_instance     : HTTP 503 (miner chute cold / no instances)
+          - upstream_error  : HTTP 502 / 504 (gateway/upstream)
+          - bad_request     : HTTP 400 / 404 (malformed prompt, unknown model)
+          - auth_error      : HTTP 401 / 403
+          - http_error      : any other non-200
+          - timeout         : httpx.TimeoutException
+          - connect_error   : httpx connection failure
+          - empty_response  : 200 but no choices
+          - no_logprobs     : 200 but choices[0].logprobs is None
+          - unexpected      : anything else
         """
-        resp = await self._http.post(
-            f"{base_url.rstrip('/')}/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "prompt": prompt,
-                "max_tokens": 1,
-                "logprobs": 1,
-                "echo": True,
-                "stream": False,
-            },
-            timeout=timeout,
-        )
+        try:
+            resp = await self._http.post(
+                f"{base_url.rstrip('/')}/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "max_tokens": 1,
+                    "logprobs": 1,
+                    "echo": True,
+                    "stream": False,
+                },
+                timeout=timeout,
+            )
+        except httpx.TimeoutException:
+            return None, {
+                "error_type": "timeout",
+                "status": None,
+                "message": f"Student forward pass timed out after {timeout}s",
+            }
+        except httpx.ConnectError as e:
+            return None, {
+                "error_type": "connect_error",
+                "status": None,
+                "message": f"Student connect error: {e}",
+            }
+        except Exception as e:
+            return None, {
+                "error_type": "unexpected",
+                "status": None,
+                "message": f"Student HTTP error: {type(e).__name__}: {e}",
+            }
 
         if resp.status_code != 200:
-            print(f"[KL] Forward pass failed: {resp.status_code} {resp.text[:300]}")
-            return None
+            body = resp.text[:300]
+            status = resp.status_code
+            if status == 429:
+                err_type = "rate_limit"
+            elif status == 503:
+                err_type = "no_instance"
+            elif status in (502, 504):
+                err_type = "upstream_error"
+            elif status in (400, 404):
+                err_type = "bad_request"
+            elif status in (401, 403):
+                err_type = "auth_error"
+            else:
+                err_type = "http_error"
+            msg = f"Student forward pass failed: HTTP {status} ({err_type}): {body}"
+            print(f"[DISTILL] {msg}")
+            return None, {"error_type": err_type, "status": status, "message": msg}
 
         data = resp.json()
         choices = data.get("choices", [])
         if not choices:
-            return None
+            return None, {
+                "error_type": "empty_response",
+                "status": 200,
+                "message": "Student response has no choices",
+            }
 
-        return choices[0].get("logprobs")
+        lp = choices[0].get("logprobs")
+        if lp is None:
+            return None, {
+                "error_type": "no_logprobs",
+                "status": 200,
+                "message": "Student response has no logprobs (model may not support echo+logprobs)",
+            }
+        return lp, None
 
     def _compute_kl(
         self,
@@ -219,7 +279,7 @@ class Actor:
                 "time_taken": time.time() - start,
                 "error": f"Teacher rollout not found: {task_id}",
                 "error_type": "rollout_not_found",
-                "extra": {"task_id": task_id},
+                "extra": {"task_id": task_id, "error_type": "rollout_not_found"},
             }
 
         teacher_lp = rollout.get("full_logprobs")
@@ -230,7 +290,8 @@ class Actor:
                 "success": False,
                 "time_taken": time.time() - start,
                 "error": "Teacher rollout has no full_logprobs",
-                "extra": {"task_id": task_id},
+                "error_type": "rollout_malformed",
+                "extra": {"task_id": task_id, "error_type": "rollout_malformed"},
             }
 
         full_text = teacher_lp["full"]
@@ -238,9 +299,11 @@ class Actor:
 
         # Student forward pass
         error = None
+        error_type = None
+        error_status = None
         kl_result = None
         try:
-            student_lp = await self._student_forward_pass(
+            student_lp, err_info = await self._student_forward_pass(
                 prompt=full_text,
                 model=model,
                 base_url=base_url,
@@ -249,11 +312,14 @@ class Actor:
             )
 
             if student_lp is None:
-                error = "Student forward pass failed"
+                error = err_info["message"]
+                error_type = err_info["error_type"]
+                error_status = err_info.get("status")
             else:
                 kl_result = self._compute_kl(teacher_logprobs, student_lp)
         except Exception as e:
             import traceback
+            error_type = "unexpected"
             error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
 
         # Score: exp(-|kl|), perfect match = 1.0
@@ -271,10 +337,13 @@ class Actor:
                 "kl": kl_result,
                 "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp is not None),
                 "model": model,
+                "error_type": error_type,
+                "error_status": error_status,
             },
         }
 
         if error:
             result["error"] = error
+            result["error_type"] = error_type
 
         return result
