@@ -5,17 +5,26 @@ Computes KL divergence between a student model and pre-generated teacher rollout
 Flow:
     1. Load teacher rollout from R2 by task_id (same pattern as SWE-INFINITE)
        Rollout contains full_logprobs: {full, token_ids, logprobs}
-    2. Student forward pass: /v1/completions with echo=True + logprobs=1
-    3. Align by token position, compute KL on assistant tokens (non-None logprobs)
+    2. Student forward pass: /v1/completions with echo=True + logprobs=20
+       to recover the student's top-20 distribution at every position.
+    3. At each assistant position we have:
+         teacher top-20 dict P = {token_str: logprob}
+         student top-20 dict Q = {token_str: logprob}
+       Compute KL restricted to P's top-20 support:
+         KL_i = sum_{t in P} exp(P[t]) * (P[t] - log Q(t))
+       where log Q(t) is taken from the student top-20 if present, and
+       otherwise bounded by the smallest logprob in the student top-20
+       (a conservative fallback for tokens outside student top-k).
 
 Task ID:
     Plain integer, maps to a teacher rollout file in R2:
       {R2_BASE_URL}/{R2_PREFIX}/task_{task_id:011d}.json
 
     The rollout JSON must contain a "full_logprobs" key with:
-      full: str           - formatted conversation text
-      token_ids: [int]    - token positions (or offsets)
-      logprobs: [float|None] - None = masked, float = assistant token logprob
+      full: str                 - formatted conversation text
+      token_ids: [int]          - token positions (or offsets)
+      logprobs: [dict|None]     - None = masked; dict = teacher top-20
+                                  {token_str: logprob} at that position
 """
 
 import math
@@ -146,7 +155,7 @@ class Actor:
                     "model": model,
                     "prompt": prompt,
                     "max_tokens": 1,
-                    "logprobs": 1,
+                    "logprobs": 20,
                     "echo": True,
                     "stream": False,
                 },
@@ -213,30 +222,63 @@ class Actor:
         teacher_logprobs: List,
         student_lp_dict: Dict,
     ) -> Dict[str, Any]:
-        """Compute KL divergence between teacher and student logprobs.
+        """Compute KL divergence using top-k distributions from both sides.
 
-        Both teacher and student have logprobs for the same token sequence.
-        Teacher logprobs[i] is None for non-assistant tokens.
-        Student logprobs come from echo=True (covers all tokens).
+        Inputs
+        ------
+        teacher_logprobs : list of dict|None
+            For each token position, either None (non-assistant) or a dict
+            {token_str: logprob} containing the teacher's top-20 candidates.
+        student_lp_dict : dict
+            Student echo=True response. We use its top_logprobs list, which
+            is aligned position-by-position with teacher_logprobs (same
+            tokenizer + same prompt => same token sequence).
 
-        We align by position: same tokenizer -> same token sequence.
+        KL estimator
+        ------------
+        At every assistant position i let P be the teacher's top-20 dict
+        and Q be the student's top-20 dict. We compute
+
+            KL_i = sum_{t in P} exp(P[t]) * (P[t] - logQ(t))
+
+        where logQ(t) is Q[t] if present, else min(Q.values()) (a
+        conservative upper bound on the student's logprob for tokens
+        outside its top-20 — this upper-bounds logQ and therefore under-
+        estimates KL, keeping the score generous but directionally
+        correct). Because the sum is restricted to P's top-20 support
+        rather than the full vocabulary, KL_i can in rare cases be
+        slightly negative; callers should clip to >= 0 before mapping to
+        a reward.
+
+        Returns per-position average KL plus bookkeeping counters.
         """
-        student_token_logprobs = student_lp_dict.get("token_logprobs", [])
+        student_top_logprobs = student_lp_dict.get("top_logprobs") or []
 
         total_kl = 0.0
         matched = 0
-        total_teacher = sum(1 for lp in teacher_logprobs if lp is not None)
+        total_teacher = sum(1 for lp in teacher_logprobs if lp)
 
-        for i, t_lp in enumerate(teacher_logprobs):
-            if t_lp is None:
+        for i, t_top in enumerate(teacher_logprobs):
+            if not t_top or not isinstance(t_top, dict):
                 continue
-            if i >= len(student_token_logprobs):
+            if i >= len(student_top_logprobs):
                 break
-            s_lp = student_token_logprobs[i]
-            if s_lp is None:
+            s_top = student_top_logprobs[i]
+            if not s_top or not isinstance(s_top, dict):
                 continue
-            # Per-token KL contribution: teacher_lp - student_lp
-            total_kl += t_lp - s_lp
+
+            # Student logprob for tokens outside its own top-k. True
+            # logprob for such tokens is <= this min, so using min as a
+            # stand-in under-estimates KL (safe lower bound).
+            s_fallback = min(s_top.values())
+
+            kl_i = 0.0
+            for tok, t_lp in t_top.items():
+                s_lp = s_top.get(tok, s_fallback)
+                # p_i * (log p_i - log q_i)
+                kl_i += math.exp(t_lp) * (t_lp - s_lp)
+
+            total_kl += kl_i
             matched += 1
 
         avg_kl = total_kl / matched if matched > 0 else 0.0
@@ -327,10 +369,11 @@ class Actor:
             error_type = "unexpected"
             error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
 
-        # Score: exp(-|kl|), perfect match = 1.0
+        # Score: exp(-kl), clipped at kl>=0 (top-k truncation may yield
+        # tiny negatives). Perfect match = 1.0.
         score = 0.0
         if kl_result and kl_result["matched_tokens"] > 0:
-            score = math.exp(-abs(kl_result["kl"]))
+            score = math.exp(-max(0.0, kl_result["kl"]))
 
         result = {
             "task_name": "distill",
@@ -340,7 +383,7 @@ class Actor:
             "extra": {
                 "task_id": task_id,
                 "kl": kl_result,
-                "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp is not None),
+                "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp),
                 "model": model,
                 "error_type": error_type,
                 "error_status": error_status,
