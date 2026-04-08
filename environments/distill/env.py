@@ -222,64 +222,70 @@ class Actor:
         teacher_logprobs: List,
         student_lp_dict: Dict,
     ) -> Dict[str, Any]:
-        """Compute KL divergence using top-k distributions from both sides.
+        """Compute KL divergence. Supports both rollout formats.
 
-        Inputs
-        ------
-        teacher_logprobs : list of dict|None
-            For each token position, either None (non-assistant) or a dict
-            {token_str: logprob} containing the teacher's top-20 candidates.
-        student_lp_dict : dict
-            Student echo=True response. We use its top_logprobs list, which
-            is aligned position-by-position with teacher_logprobs (same
-            tokenizer + same prompt => same token sequence).
-
-        KL estimator
-        ------------
-        At every assistant position i let P be the teacher's top-20 dict
-        and Q be the student's top-20 dict. We compute
+        New format (teacher dict per position): use the teacher's top-20
+        support set to compute an explicit KL against the student's
+        top-20 distribution:
 
             KL_i = sum_{t in P} exp(P[t]) * (P[t] - logQ(t))
 
-        where logQ(t) is Q[t] if present, else min(Q.values()) (a
-        conservative upper bound on the student's logprob for tokens
-        outside its top-20 — this upper-bounds logQ and therefore under-
-        estimates KL, keeping the score generous but directionally
-        correct). Because the sum is restricted to P's top-20 support
-        rather than the full vocabulary, KL_i can in rare cases be
-        slightly negative; callers should clip to >= 0 before mapping to
-        a reward.
+        where logQ(t) is Q[t] if present, else min(Q.values()) as a
+        conservative under-estimate for tokens outside student top-k.
 
-        Returns per-position average KL plus bookkeeping counters.
+        Legacy format (teacher float per position): the rollout only
+        stored the chosen token's logprob. Fall back to the single-
+        sample Monte-Carlo estimator
+
+            KL_i ~= logP(t_chosen) - logQ(t_chosen)
+
+        which is unbiased but noisy; negatives from MC noise or top-k
+        truncation are clipped by the caller.
+
+        Both branches can coexist in the same rollout (e.g. during a
+        format migration) and per-position contributions are averaged
+        uniformly.
         """
         student_top_logprobs = student_lp_dict.get("top_logprobs") or []
+        student_token_logprobs = student_lp_dict.get("token_logprobs") or []
 
         total_kl = 0.0
         matched = 0
-        total_teacher = sum(1 for lp in teacher_logprobs if lp)
+        total_teacher = sum(1 for lp in teacher_logprobs if lp is not None)
 
-        for i, t_top in enumerate(teacher_logprobs):
-            if not t_top or not isinstance(t_top, dict):
-                continue
-            if i >= len(student_top_logprobs):
-                break
-            s_top = student_top_logprobs[i]
-            if not s_top or not isinstance(s_top, dict):
+        for i, t_entry in enumerate(teacher_logprobs):
+            if t_entry is None:
                 continue
 
-            # Student logprob for tokens outside its own top-k. True
-            # logprob for such tokens is <= this min, so using min as a
-            # stand-in under-estimates KL (safe lower bound).
-            s_fallback = min(s_top.values())
+            if isinstance(t_entry, dict):
+                # New path: top-k dict on both sides.
+                if i >= len(student_top_logprobs):
+                    break
+                s_top = student_top_logprobs[i]
+                if not s_top or not isinstance(s_top, dict):
+                    continue
 
-            kl_i = 0.0
-            for tok, t_lp in t_top.items():
-                s_lp = s_top.get(tok, s_fallback)
-                # p_i * (log p_i - log q_i)
-                kl_i += math.exp(t_lp) * (t_lp - s_lp)
+                # Under-estimate for tokens outside student top-k.
+                s_fallback = min(s_top.values())
 
-            total_kl += kl_i
-            matched += 1
+                kl_i = 0.0
+                for tok, t_lp in t_entry.items():
+                    s_lp = s_top.get(tok, s_fallback)
+                    kl_i += math.exp(t_lp) * (t_lp - s_lp)
+
+                total_kl += kl_i
+                matched += 1
+            else:
+                # Legacy path: teacher stored only chosen-token logprob.
+                # Use student's token_logprobs[i] (same chosen token,
+                # same tokenizer) for a single-sample MC estimate.
+                if i >= len(student_token_logprobs):
+                    break
+                s_lp = student_token_logprobs[i]
+                if s_lp is None:
+                    continue
+                total_kl += float(t_entry) - s_lp
+                matched += 1
 
         avg_kl = total_kl / matched if matched > 0 else 0.0
 
@@ -383,7 +389,7 @@ class Actor:
             "extra": {
                 "task_id": task_id,
                 "kl": kl_result,
-                "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp),
+                "teacher_tokens_count": sum(1 for lp in teacher_logprobs if lp is not None),
                 "model": model,
                 "error_type": error_type,
                 "error_status": error_status,
