@@ -61,7 +61,9 @@ class R2Cache:
 
     def _url(self, task_id: int) -> str:
         filename = f"task_{task_id:011d}.json"
-        return f"{self.base_url}/{self.prefix}/{filename}"
+        if self.prefix:
+            return f"{self.base_url}/{self.prefix}/{filename}"
+        return f"{self.base_url}/{filename}"
 
     def load(self, task_id: int) -> Optional[Dict]:
         url = self._url(task_id)
@@ -82,8 +84,10 @@ class Actor:
     """Computes KL divergence between student model and teacher rollouts."""
 
     def __init__(self):
-        r2_base = os.getenv("KL_R2_BASE_URL", "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev")
-        r2_prefix = os.getenv("KL_R2_PREFIX", "teacher_rollouts")
+        # Default to the public distill bucket. Files live at the bucket
+        # root (no prefix) — see teacher_mover for the promotion pipeline.
+        r2_base = os.getenv("KL_R2_BASE_URL", "https://pub-4546777cb27840ec91b892f19eb5742b.r2.dev")
+        r2_prefix = os.getenv("KL_R2_PREFIX", "")
         cache_dir = os.getenv("KL_CACHE_DIR", "/tmp/kl-cache")
 
         self._local = LocalCache(cache_dir)
