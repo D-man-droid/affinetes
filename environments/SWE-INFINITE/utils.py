@@ -18,12 +18,13 @@ git config user.name "SWE-INFINITE Agent"
 git checkout --orphan sanitized_branch
 git add -A
 git commit -m "Initial state"
-git branch -D main 2>/dev/null || git branch -D master 2>/dev/null || true
+git branch | grep -v '^\\*' | xargs -r git branch -D 2>/dev/null || true
+git remote remove origin 2>/dev/null || true
 git branch -m main
-rm -rf .git/logs
-rm -rf .git/refs/original
+rm -rf .git/logs .git/refs/original .git/refs/remotes
+grep -E '^#|refs/heads/main' .git/packed-refs > /tmp/_pr_clean 2>/dev/null && mv /tmp/_pr_clean .git/packed-refs || rm -f .git/packed-refs
 git reflog expire --expire=now --all 2>/dev/null || true
-git gc --prune=now 2>/dev/null || true
+git gc --aggressive --prune=now 2>/dev/null || true
 echo "Git history sanitized"
 """
 
