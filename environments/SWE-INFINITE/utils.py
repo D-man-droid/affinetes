@@ -45,6 +45,7 @@ cat >> /etc/hosts << 'HOSTS_EOF' 2>/dev/null || true
 0.0.0.0 github.com
 0.0.0.0 www.github.com
 0.0.0.0 api.github.com
+0.0.0.0 docs.github.com
 0.0.0.0 raw.githubusercontent.com
 0.0.0.0 codeload.github.com
 0.0.0.0 gist.github.com
