@@ -14,7 +14,7 @@ import yaml
 
 # Allow importing from parent directory (SWE-INFINITE/)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, is_blacklisted_command
+from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, NETWORK_BLOCKLIST_SCRIPT, is_blacklisted_command
 
 
 def _strip_thinking_tags(content: str) -> str:
@@ -93,7 +93,13 @@ class MiniSWEAgent:
         print(f"[MINISWE] Applied {label} patch: {result.stdout[:200]}")
 
     def _prepare_container(self) -> None:
-        """Sanitize git history and normalize timestamps (no patches to apply)."""
+        """Apply network blocklist, sanitize git history, normalize timestamps."""
+        subprocess.run(
+            ["docker", "exec", self._container_name, "bash", "-c", NETWORK_BLOCKLIST_SCRIPT],
+            capture_output=True, text=True, timeout=10,
+        )
+        print("[MINISWE] Network blocklist applied")
+
         result = subprocess.run(
             ["docker", "exec", self._container_name, "bash", "-c", SANITIZE_GIT_SCRIPT],
             capture_output=True, text=True, timeout=60,

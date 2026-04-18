@@ -36,6 +36,7 @@ from affinetes.core.openenv import OpenEnvResponse
 from utils import (
     SANITIZE_GIT_SCRIPT,
     NORMALIZE_TIMESTAMPS_SCRIPT,
+    NETWORK_BLOCKLIST_SCRIPT,
     DIFF_EXTENSIONS,
     parse_test_output,
 )
@@ -358,6 +359,7 @@ class InfiniteActor:
             apply_cmds = "\n".join(apply_steps)
 
             entryscript = f"""
+{NETWORK_BLOCKLIST_SCRIPT}
 cd /app
 {apply_cmds}
 git apply --recount --whitespace=fix /workspace/fix_patch.diff 2>&1 || {{ echo "PATCH_APPLY_FAILED"; }}
@@ -579,7 +581,10 @@ bash /workspace/entryscript.sh
         print(f"[SWE-INFINITE] Applied {label} patch: {result.get('output', '')[:200]}")
 
     def _sanitize_git_in_container(self, container_id: str) -> None:
-        """Sanitize git history to prevent cheating."""
+        """Apply network blocklist, sanitize git, normalize timestamps."""
+        self._execute_in_container(container_id, NETWORK_BLOCKLIST_SCRIPT, timeout=10)
+        print("[SWE-INFINITE] Network blocklist applied")
+
         result = self._execute_in_container(container_id, SANITIZE_GIT_SCRIPT, timeout=60)
         print(f"[SWE-INFINITE] Git sanitized: {result.get('output', '')[:200]}")
 

@@ -10,7 +10,7 @@ from typing import Optional, Dict, List, Tuple, Any
 
 # Allow importing from parent directory (SWE-INFINITE/)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, DIFF_EXTENSIONS
+from utils import SANITIZE_GIT_SCRIPT, NORMALIZE_TIMESTAMPS_SCRIPT, NETWORK_BLOCKLIST_SCRIPT, DIFF_EXTENSIONS
 
 DOCKER_PULL_TIMEOUT = 300
 
@@ -152,7 +152,10 @@ class CodexAgent:
         print(f"[CODEX] Applied {label} patch: {result.stdout[:200]}")
 
     def _prepare_container(self) -> None:
-        """Sanitize git history and normalize timestamps."""
+        """Apply network blocklist, sanitize git history, normalize timestamps."""
+        self._exec(NETWORK_BLOCKLIST_SCRIPT, timeout=10)
+        print("[CODEX] Network blocklist applied")
+
         result = self._exec(SANITIZE_GIT_SCRIPT, timeout=60)
         print(f"[CODEX] Git sanitized: {result.stdout[:200]}")
 

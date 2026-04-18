@@ -35,6 +35,59 @@ find . -not -path './.git/*' -not -path './node_modules/*' -not -path './.venv/*
 echo "Timestamps normalized"
 """
 
+# Network blocklist: prevent agents from looking up fix code on the internet.
+# Uses /etc/hosts to nullify DNS for code-hosting, Q&A, and search sites.
+# Naive bypasses (curl --resolve, DoH) still work; stronger defense requires
+# iptables + CAP_NET_ADMIN.
+NETWORK_BLOCKLIST_SCRIPT = """
+cat >> /etc/hosts << 'HOSTS_EOF' 2>/dev/null || true
+# --- code hosting ---
+0.0.0.0 github.com
+0.0.0.0 www.github.com
+0.0.0.0 api.github.com
+0.0.0.0 raw.githubusercontent.com
+0.0.0.0 codeload.github.com
+0.0.0.0 gist.github.com
+0.0.0.0 gist.githubusercontent.com
+0.0.0.0 objects.githubusercontent.com
+0.0.0.0 camo.githubusercontent.com
+0.0.0.0 user-images.githubusercontent.com
+0.0.0.0 github.githubassets.com
+0.0.0.0 uploads.github.com
+0.0.0.0 gitlab.com
+0.0.0.0 www.gitlab.com
+0.0.0.0 bitbucket.org
+0.0.0.0 api.bitbucket.org
+0.0.0.0 codeberg.org
+0.0.0.0 sourceforge.net
+0.0.0.0 sourcegraph.com
+0.0.0.0 grep.app
+# --- Q&A forums ---
+0.0.0.0 stackoverflow.com
+0.0.0.0 www.stackoverflow.com
+0.0.0.0 stackexchange.com
+# --- search engines ---
+0.0.0.0 google.com
+0.0.0.0 www.google.com
+0.0.0.0 bing.com
+0.0.0.0 www.bing.com
+0.0.0.0 duckduckgo.com
+0.0.0.0 www.duckduckgo.com
+# --- DNS-over-HTTPS (prevent hostname resolution bypass) ---
+0.0.0.0 cloudflare-dns.com
+0.0.0.0 dns.cloudflare.com
+0.0.0.0 mozilla.cloudflare-dns.com
+0.0.0.0 dns.google
+0.0.0.0 dns.google.com
+0.0.0.0 dns.quad9.net
+0.0.0.0 dns9.quad9.net
+0.0.0.0 dns.nextdns.io
+0.0.0.0 doh.opendns.com
+0.0.0.0 doh.cleanbrowsing.org
+HOSTS_EOF
+echo "Network blocklist applied"
+"""
+
 # Commands that fingerprint the codebase instead of solving the task
 _BLACKLISTED_PATTERNS = [
     re.compile(r'\bsha256sum\b'),
