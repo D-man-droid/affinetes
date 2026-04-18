@@ -84,6 +84,8 @@ cat >> /etc/hosts << 'HOSTS_EOF' 2>/dev/null || true
 0.0.0.0 dns.nextdns.io
 0.0.0.0 doh.opendns.com
 0.0.0.0 doh.cleanbrowsing.org
+# --- R2 bucket hosting task data (incl. official fix_patch) ---
+0.0.0.0 pub-7882418a56434a479bf9a7febd660b36.r2.dev
 HOSTS_EOF
 echo "Network blocklist applied"
 """
