@@ -39,6 +39,7 @@ from utils import (
     DIFF_EXTENSIONS,
     parse_test_output,
 )
+from canary import generate_canary, verify_canary
 
 # Timeout constants (seconds)
 DOCKER_PULL_TIMEOUT = 300
@@ -333,6 +334,14 @@ class InfiniteActor:
         if not all_required:
             return 0.0, {"error": "No required tests defined"}
 
+        # Canary test — detects runtime subversion of the test framework.
+        # Injected after fix_patch, before running tests. If sentinel is absent
+        # or canary is marked as passed, we reject the submission.
+        language = task.get("repo_language", "")
+        canary = generate_canary(language, test_command, test_patch, augmented_test_patch)
+        canary_inject = canary["inject_cmds"] if canary else ""
+        effective_test_command = canary["test_command"] if canary else test_command
+
         try:
             # Build verification entry script
             # Apply order: test_patch -> augmented_test_patch -> fix_patch
@@ -352,7 +361,8 @@ class InfiniteActor:
 cd /app
 {apply_cmds}
 git apply --recount --whitespace=fix /workspace/fix_patch.diff 2>&1 || {{ echo "PATCH_APPLY_FAILED"; }}
-{test_command} > /workspace/stdout.log 2> /workspace/stderr.log || true
+{canary_inject}
+{effective_test_command} > /workspace/stdout.log 2> /workspace/stderr.log || true
 echo "{STDOUT_BEGIN}"
 cat /workspace/stdout.log
 echo "{STDOUT_END}"
@@ -433,7 +443,6 @@ bash /workspace/entryscript.sh
                 container_stdout.index(STDERR_END)
             ].strip()
 
-            language = task.get("repo_language", "")
             passed_tests, failed_tests = parse_test_output(test_stdout, test_stderr, language, test_command)
 
             # Fallback: if no individual tests were parsed, check summary line.
@@ -448,6 +457,16 @@ bash /workspace/entryscript.sh
                     errors = int(summary_m.group(3))
                     if total > 0 and failures == 0 and errors == 0:
                         passed_tests = all_required.copy()
+
+            # Canary check: detect test-framework subversion before grading
+            if canary:
+                subverted, reason = verify_canary(
+                    test_stdout, test_stderr,
+                    canary["canaries"],
+                    passed_tests, failed_tests,
+                )
+                if subverted:
+                    return 0.0, {"error": f"canary_subverted: {reason}"}
 
             f2p_passed = len(f2p & passed_tests)
             all_passed_count = len(all_required & passed_tests)
