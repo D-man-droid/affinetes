@@ -88,6 +88,17 @@ class CodexAgent:
             print(f"[CODEX] Codex binary not working: {result.stderr[:500]}")
             return False
         print(f"[CODEX] Codex ready: {result.stdout.strip()}")
+
+        # Expose codex's argv[0]-dispatched apply_patch in the default PATH
+        # (/usr/local/bin) so `bash -lc apply_patch ...` works. Login shells
+        # reset PATH from /etc/profile and drop codex's auto-injected
+        # ~/.codex/tmp/path/ entry, breaking the model's frequent
+        # `bash -lc apply_patch '...'` calls otherwise.
+        self._exec(
+            "ln -sf /usr/local/bin/codex /usr/local/bin/apply_patch && "
+            "ln -sf /usr/local/bin/codex /usr/local/bin/applypatch",
+            timeout=5,
+        )
         return True
 
     def _write_codex_config(self) -> None:
